@@ -157,6 +157,15 @@ dark) and keeps the packed bits: that is the darkening, not lost energy.
 Fix: replace the blur with a centre-only shader of our own that does exactly that output step
 (0.0.4), then measure again.
 
+### 0.0.4 measurements (analysis/run4): centre-only pass, still darker
+
+Denoiser on: lit u0 lum 0.0359, GI B (t10) b 0.0830. Denoiser OFF (history cleared + mips/gapfix
+skipped + centre-only output): lit 0.0233 (**-35 %**, user also sees it dark), GI B b 0.0011.
+The centre pass ran (log). B.z (which sets f) collapses, so the loss now comes from upstream:
+most likely the temporal pass with cleared history (B.z = lerp(history B.z, raw .w, w)), not the
+output step. 0.0.5 adds a sweep that measures each combination (game, centre only, centre +
+skips, clear history only, all) after 90 frames each, to pin it down.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and

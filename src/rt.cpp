@@ -581,28 +581,101 @@ std::string MeasureOne(command_queue* q, resource src, resource_usage state) {
     return out;
 }
 
+// Every measurable texture of one pass, logged with a label.
+std::string MeasurePass(command_queue* q, int mp, const char* label) {
+    BindingMap m;
+    std::vector<resource_usage> states;
+    {
+        std::lock_guard<std::mutex> lock(g_mapMutex);
+        m = g_maps[mp];
+        for (const Slot& s : m.slots) states.push_back(StateOf(s.res));
+    }
+    std::string all = Format("%s, %s:", kPasses[mp].name, label);
+    for (size_t i = 0; i < m.slots.size(); ++i) {
+        const std::string r = MeasureOne(q, m.slots[i].res, states[i]);
+        if (!r.empty()) all += Format("\n  %s %s", m.slots[i].reg, r.c_str());
+    }
+    Log("measure %s", all.c_str());
+    return all;
+}
+
+// Sweep: each experiment combination in turn, 90 presents to settle, then rt-composite and
+// gi-temporal are measured. The user's own switches are put back afterwards.
+struct SweepConfig {
+    const char* name;
+    bool clearHistory, centre, skipMipsGap;
+};
+const SweepConfig kSweep[] = {
+    {"all off (game)", false, false, false},
+    {"centre-only blur", false, true, false},
+    {"centre-only + skip mips/gapfix", false, true, true},
+    {"clear history only", true, false, false},
+    {"all (denoiser OFF)", true, true, true},
+};
+constexpr int kSweepCount = sizeof(kSweep) / sizeof(kSweep[0]);
+constexpr int kSweepSettle = 90;
+std::atomic<bool> g_sweepRequested{false};
+int g_sweepIndex = -1, g_sweepWait = 0;
+bool g_savedFlags[5] = {};  // denoiserOff, clearHistory, blurCopy, skip mips, skip gapfix
+std::string g_sweepResult;  // g_viewMutex
+
+void ApplySweep(const SweepConfig& c) {
+    g_denoiserOff = false;
+    g_clearHistory = c.clearHistory;
+    g_blurCopy = c.centre;
+    g_skip[kGiMips] = c.skipMipsGap;
+    g_skip[kGiGapFix] = c.skipMipsGap;
+}
+
+void SweepStep(command_queue* q) {
+    if (g_sweepRequested.exchange(false) && g_sweepIndex < 0) {
+        g_savedFlags[0] = g_denoiserOff, g_savedFlags[1] = g_clearHistory, g_savedFlags[2] = g_blurCopy;
+        g_savedFlags[3] = g_skip[kGiMips], g_savedFlags[4] = g_skip[kGiGapFix];
+        g_sweepIndex = 0;
+        g_sweepWait = kSweepSettle;
+        ApplySweep(kSweep[0]);
+        std::lock_guard<std::mutex> vlock(g_viewMutex);
+        g_sweepResult = "sweep running...";
+        Log("sweep started");
+        return;
+    }
+    if (g_sweepIndex < 0 || --g_sweepWait > 0) return;
+    const SweepConfig& c = kSweep[g_sweepIndex];
+    const std::string comp = MeasurePass(q, kComposite, c.name);
+    MeasurePass(q, kGiTemporal, c.name);
+    // Short line for the overlay: lit colour (u0) and GI B (t10) of the composite.
+    auto pick = [&](const char* reg) {
+        const size_t p = comp.find(Format("\n  %s avg", reg));
+        if (p == std::string::npos) return std::string("-");
+        const size_t l = comp.find("lum ", p);
+        return l == std::string::npos ? std::string("-") : comp.substr(l + 4, comp.find(' ', l + 4) - (l + 4));
+    };
+    {
+        std::lock_guard<std::mutex> vlock(g_viewMutex);
+        if (g_sweepIndex == 0) g_sweepResult.clear();
+        g_sweepResult += Format("%-32s lit lum %s, GI B lum %s\n", c.name, pick("u0").c_str(), pick("t10").c_str());
+    }
+    if (++g_sweepIndex < kSweepCount) {
+        ApplySweep(kSweep[g_sweepIndex]);
+        g_sweepWait = kSweepSettle;
+        return;
+    }
+    g_sweepIndex = -1;
+    g_denoiserOff = g_savedFlags[0], g_clearHistory = g_savedFlags[1], g_blurCopy = g_savedFlags[2];
+    g_skip[kGiMips] = g_savedFlags[3], g_skip[kGiGapFix] = g_savedFlags[4];
+    Log("sweep done");
+}
+
 void OnPresent(command_queue* q, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
     if (g_dumpRequested.exchange(false))
         for (int i = 0; i < kPassCount; ++i) g_dumpPending[i] = true;
 
     if (g_measureRequested.exchange(false) && g_viewPass.load() >= 0) {
-        const int mp = g_viewPass.load();
-        BindingMap m;
-        std::vector<resource_usage> states;
-        {
-            std::lock_guard<std::mutex> lock(g_mapMutex);
-            m = g_maps[mp];
-            for (const Slot& s : m.slots) states.push_back(StateOf(s.res));
-        }
-        std::string all = Format("%s, denoiser %s:", kPasses[mp].name, g_denoiserOff.load() ? "OFF" : "on");
-        for (size_t i = 0; i < m.slots.size(); ++i) {
-            const std::string r = MeasureOne(q, m.slots[i].res, states[i]);
-            if (!r.empty()) all += Format("\n  %s %s", m.slots[i].reg, r.c_str());
-        }
-        Log("measure %s", all.c_str());
+        const std::string all = MeasurePass(q, g_viewPass.load(), g_denoiserOff.load() ? "denoiser OFF" : "denoiser on");
         std::lock_guard<std::mutex> vlock(g_viewMutex);
         g_measure = all;
     }
+    SweepStep(q);
 
     const int pass = g_viewPass.load();
     device* dev = q->get_device();
@@ -721,6 +794,12 @@ void DrawOverlay() {
     }
     ImGui::TextDisabled("experiment actions so far: %llu", g_actions.load());
     if (ImGui::Button("Dump bindings + constants (F11)")) RequestDump();
+    ImGui::SameLine();
+    if (ImGui::Button("Run sweep (every combination, ~10 s, stand still)")) g_sweepRequested = true;
+    {
+        std::lock_guard<std::mutex> vlock(g_viewMutex);
+        if (!g_sweepResult.empty()) ImGui::TextUnformatted(g_sweepResult.c_str());
+    }
 
     ImGui::Separator();
     ImGui::TextDisabled("Texture viewer (copied at present):");
