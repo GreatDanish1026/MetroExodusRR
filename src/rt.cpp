@@ -101,7 +101,8 @@ std::unordered_map<uint64_t, resource_view> g_srvs;    // our SRVs (centre pass)
 std::atomic<bool> g_skip[kPassCount] = {};
 std::atomic<bool> g_blurCopy{false};
 std::atomic<bool> g_clearHistory{false};  // breaks the GI (count kept, history black): kept for reference
-std::atomic<bool> g_resetCount{false};    // frame count bits of the temporal pass's t3 zeroed
+std::atomic<bool> g_resetCount{false};    // frame count of the temporal pass's t3 capped
+std::atomic<int> g_countCap{0};           // the cap (0 = current frame only, 31 = game)
 // All of the GI denoiser off at once: history cleared, mips + gap fix skipped, blur -> copy.
 std::atomic<bool> g_denoiserOff{false};
 std::atomic<bool> g_measureRequested{false};
@@ -342,12 +343,15 @@ bool RunCountReset(command_list* cl, const ListState& st, const BindingMap& m) {
         uav.count = 1;
         uav.visibility = shader_stage::all_compute;
         uav.type = descriptor_type::unordered_access_view;
-        const pipeline_layout_param param(uav);
+        constant_range c = {};
+        c.count = 1;
+        c.visibility = shader_stage::all_compute;
+        const pipeline_layout_param params[2] = {pipeline_layout_param(uav), pipeline_layout_param(c)};
         shader_desc cs = {};
         cs.code = kCountResetCs;
         cs.code_size = sizeof(kCountResetCs);
         pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
-        if (!dev->create_pipeline_layout(1, &param, &g_resetLayout) || !dev->create_pipeline(g_resetLayout, 1, &sub, &g_resetPipe)) {
+        if (!dev->create_pipeline_layout(2, params, &g_resetLayout) || !dev->create_pipeline(g_resetLayout, 1, &sub, &g_resetPipe)) {
             g_resetFailed = true;
             ResetFail("couldn't create the shader");
         } else {
@@ -374,6 +378,8 @@ bool RunCountReset(command_list* cl, const ListState& st, const BindingMap& m) {
     u.type = descriptor_type::unordered_access_view;
     u.descriptors = &uav;
     cl->push_descriptors(shader_stage::all_compute, g_resetLayout, 0, u);
+    const uint32_t cap = static_cast<uint32_t>(g_countCap.load());
+    cl->push_constants(shader_stage::all_compute, g_resetLayout, 1, 0, 1, &cap);
     cl->dispatch((d.texture.width + 7) / 8, (d.texture.height + 7) / 8, 1);
     cl->barrier(r, resource_usage::unordered_access, state);
     RestoreCompute(cl, st);
@@ -667,26 +673,31 @@ std::string MeasurePass(command_queue* q, int mp, const char* label) {
 // gi-temporal are measured. The user's own switches are put back afterwards.
 struct SweepConfig {
     const char* name;
-    bool resetCount, centre, skipMipsGap;
+    int cap;  // frame count cap, -1 = not capped
+    bool centre, skipMipsGap;
 };
 const SweepConfig kSweep[] = {
-    {"all off (game)", false, false, false},
-    {"centre-only blur", false, true, false},
-    {"centre-only + skip mips/gapfix", false, true, true},
-    {"reset frame count only", true, false, false},
-    {"all (denoiser OFF)", true, true, true},
+    {"all off (game)", -1, false, false},
+    {"spatial off (centre + skips)", -1, true, true},
+    {"spatial off, count cap 7", 7, true, true},
+    {"spatial off, count cap 3", 3, true, true},
+    {"spatial off, count cap 1", 1, true, true},
+    {"spatial off, count cap 0", 0, true, true},
+    {"count cap 0 only (spatial on)", 0, false, false},
 };
 constexpr int kSweepCount = sizeof(kSweep) / sizeof(kSweep[0]);
 constexpr int kSweepSettle = 90;
 std::atomic<bool> g_sweepRequested{false};
 int g_sweepIndex = -1, g_sweepWait = 0;
-bool g_savedFlags[5] = {};  // denoiserOff, clearHistory, blurCopy, skip mips, skip gapfix
+bool g_savedFlags[5] = {};  // denoiserOff, resetCount, blurCopy, skip mips, skip gapfix
+int g_savedCap = 0;
 std::string g_sweepResult;  // g_viewMutex
 
 void ApplySweep(const SweepConfig& c) {
     g_denoiserOff = false;
     g_clearHistory = false;
-    g_resetCount = c.resetCount;
+    g_resetCount = c.cap >= 0;
+    if (c.cap >= 0) g_countCap = c.cap;
     g_blurCopy = c.centre;
     g_skip[kGiMips] = c.skipMipsGap;
     g_skip[kGiGapFix] = c.skipMipsGap;
@@ -696,6 +707,7 @@ void SweepStep(command_queue* q) {
     if (g_sweepRequested.exchange(false) && g_sweepIndex < 0) {
         g_savedFlags[0] = g_denoiserOff, g_savedFlags[1] = g_resetCount, g_savedFlags[2] = g_blurCopy;
         g_savedFlags[3] = g_skip[kGiMips], g_savedFlags[4] = g_skip[kGiGapFix];
+        g_savedCap = g_countCap;
         g_sweepIndex = 0;
         g_sweepWait = kSweepSettle;
         ApplySweep(kSweep[0]);
@@ -728,6 +740,7 @@ void SweepStep(command_queue* q) {
     g_sweepIndex = -1;
     g_denoiserOff = g_savedFlags[0], g_resetCount = g_savedFlags[1], g_blurCopy = g_savedFlags[2];
     g_skip[kGiMips] = g_savedFlags[3], g_skip[kGiGapFix] = g_savedFlags[4];
+    g_countCap = g_savedCap;
     Log("sweep done");
 }
 
@@ -852,7 +865,11 @@ void DrawOverlay() {
     if (ImGui::Checkbox("GI denoiser OFF (all of the below at once)", &v)) g_denoiserOff = v;
     ImGui::TextDisabled("Individual experiments:");
     v = g_resetCount.load();
-    if (ImGui::Checkbox("GI: reset the frame count (no temporal accumulation)", &v)) g_resetCount = v;
+    if (ImGui::Checkbox("GI: cap the frame count", &v)) g_resetCount = v;
+    ImGui::SameLine();
+    int cap = g_countCap.load();
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::SliderInt("max frames of history", &cap, 0, 31)) g_countCap = cap;
     if (!g_resetError.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%s", g_resetError.c_str());
     ImGui::TextDisabled("frame count resets run: %llu", g_resetRuns.load());
     v = g_clearHistory.load();

@@ -201,6 +201,17 @@ f = saturate(B.z * 12) * 0.9 + 0.1 of a single noisy B.z sample is biased low (c
 game's blur computes f from blurred B.z). 0.0.7: the centre pass takes B.z (and f) from a 5x5
 stride-2 average of B.z; A, B.x, B.y stay the centre pixel (noisy GI colour for RR).
 
+### 0.0.7 sweep (analysis/run7)
+
+game 0.0360; centre-only 0.0371 (+3 %); centre + skips 0.0367; reset count only 0.0353 (-2 %);
+all 0.0315 (**-12.5 %**). Averaging B.z only recovered a quarter of the loss, so most of the bias
+comes from the temporal pass itself when it gets single samples with no spatial filter after it
+(its YCoCg/SH conversion clamps, e.g. max(luma, 0), and compresses with 1/(1 + luma)).
+
+0.0.8: the reset became a **cap** (count = min(count, N), slider 0-31, push constant), and the
+sweep now runs: game, spatial off, spatial off with cap 7/3/1/0, cap 0 with the spatial filter on.
+A small cap may give RR an almost-raw signal without the brightness loss.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
