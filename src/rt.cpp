@@ -110,7 +110,7 @@ std::atomic<bool> g_measureRequested{false};
 std::atomic<bool> g_dumpRequested{false};
 
 std::atomic<bool> g_rrWanted{true};    // overlay: Ray Reconstruction instead of the game's DLSS
-std::atomic<int> g_rrPreset{0};        // RR model hint: 0 NVIDIA default, 4 D, 5 E
+std::atomic<int> g_rrPreset{0};        // RR model hint: 0 NVIDIA default, 4 D, 5 E, 6 F
 std::atomic<bool> g_rrWorking{false};  // rr.cpp: RR ran last frame
 // RR needs the GI noisy: the denoiser goes off while RR runs.
 bool DenoiserOff() { return g_denoiserOff.load() || (g_rrWanted.load() && g_rrWorking.load()); }
@@ -1042,14 +1042,14 @@ void SetRrWorking(bool on) { g_rrWorking = on; }
 
 // ---------------------------------------------------------------- settings (ReShade.ini [MetroExodusRR])
 
-const char* const kRrModelNames[] = {"NVIDIA default", "D (transformer)", "E (latest transformer)"};
-const int kRrModelValues[] = {0, 4, 5};
+const char* const kRrModelNames[] = {"NVIDIA default", "D", "E", "F (latest)"};
+const int kRrModelValues[] = {0, 4, 5, 6};
 
 void LoadSettings() {
     bool rrOn = true;
     if (reshade::get_config_value(nullptr, MD_PRODUCT, "RayReconstruction", rrOn)) g_rrWanted = rrOn;
     int preset = 0;
-    if (reshade::get_config_value(nullptr, MD_PRODUCT, "RRModel", preset) && (preset == 0 || preset == 4 || preset == 5))
+    if (reshade::get_config_value(nullptr, MD_PRODUCT, "RRModel", preset) && (preset == 0 || (preset >= 4 && preset <= 6)))
         g_rrPreset = preset;
     int frames = 3;
     if (reshade::get_config_value(nullptr, MD_PRODUCT, "GiHistoryFrames", frames) && frames >= 0 && frames <= 31) g_countCap = frames;
@@ -1071,14 +1071,14 @@ void DrawSettings() {
         "illumination and reflections and upscales. The game's GI denoiser is switched off while it runs.\n"
         "Off: the game's own DLSS and denoiser, unchanged. Needs DLSS selected in the game's options.");
     int idx = 0;
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
         if (kRrModelValues[i] == g_rrPreset.load()) idx = i;
     ImGui::SetNextItemWidth(220);
-    if (ImGui::Combo("Ray Reconstruction model", &idx, kRrModelNames, 3)) {
+    if (ImGui::Combo("Ray Reconstruction model", &idx, kRrModelNames, 4)) {
         g_rrPreset = kRrModelValues[idx];
         reshade::set_config_value(nullptr, MD_PRODUCT, "RRModel", g_rrPreset.load());
     }
-    Tip("NVIDIA default lets the driver pick. D and E are the transformer models; E is the newest.");
+    Tip("NVIDIA default lets the driver pick. D, E and F are the transformer models; F is the latest.");
     int cap = g_countCap.load();
     ImGui::SetNextItemWidth(220);
     if (ImGui::SliderInt("GI history frames", &cap, 0, 8)) {

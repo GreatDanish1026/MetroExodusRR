@@ -46,7 +46,7 @@ struct Guides {
 };
 bool LatestGuides(Guides* out);
 bool RrWanted();              // overlay switch
-int RrPreset();               // RR model hint (0 default, 4 D, 5 E)
+int RrPreset();               // RR model hint (0 default, 4 D, 5 E, 6 F)
 void SetRrWorking(bool on);   // rr.cpp: RR ran this frame (turns the game's GI denoiser off)
 }  // namespace rt
 

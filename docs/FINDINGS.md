@@ -281,8 +281,8 @@ User verdict: the overlay showed "running: 2224x1248 -> 3840x2160" and **the pic
 
 ## 1.0.0 (2026-11-20)
 
-Release build of 0.1.0: settings in ReShade.ini [MetroExodusRR] (RayReconstruction, RRModel 0/4/5
-= NVIDIA default / D / E, GiHistoryFrames default 3; changing the model recreates the feature),
+Release build of 0.1.0: settings in ReShade.ini [MetroExodusRR] (RayReconstruction, RRModel 0/4/5/6
+= NVIDIA default / D / E / F, GiHistoryFrames default 3; changing the model recreates the feature),
 overlay = settings + status, testing tools under "Advanced"; compute shader files and the F10/F11
 hotkeys only with Debug=1. Release zip: add-on, nvngx_dlssd.dll 310.9.16 (signature checked by
 build.ps1), README, LICENSE, THIRD_PARTY_NOTICES.txt, licenses\NVIDIA-DLSS-LICENSE.txt.

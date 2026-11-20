@@ -19,7 +19,7 @@ in the game's options (any DLSS quality mode).
   skipped and its temporal accumulation is capped at a few frames, so Ray Reconstruction gets the
   ray-traced GI close to raw. The reflections have no denoiser of their own in this game: they go to
   Ray Reconstruction as traced. With Ray Reconstruction off, the game's denoiser is untouched.
-- **Ray Reconstruction model**: NVIDIA's default, D or E (transformer models).
+- **Ray Reconstruction model**: NVIDIA's default, D, E or F (transformer models; F is the latest).
 - **GI history frames** (default 3): how many frames the game's GI accumulation keeps before Ray
   Reconstruction. Fewer is rawer, but the game's GI encoding then loses brightness (0 is about
   12 % darker); 3 keeps the picture within 2 % of the game's own brightness.
