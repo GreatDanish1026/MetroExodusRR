@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
+#include "gi_center_cs.h"  // kGiCenterCs, built from gi_center.hlsl
 #include "common.hpp"
 #include "version.h"
 
@@ -66,6 +67,7 @@ int PassFromCs(uint32_t cs) {
 
 struct ListState {
     uint32_t cs = 0;
+    pipeline pipe = {0};
     pipeline_layout layout = {0};
     descriptor_table tables[8] = {};
     buffer_range cbv[8] = {};
@@ -91,12 +93,12 @@ BindingMap g_maps[kPassCount];
 bool g_seenPass[kPassCount] = {};
 std::unordered_map<uint64_t, resource_usage> g_state;  // last barrier target of resources in a map
 std::set<uint64_t> g_tracked;                          // resources whose barriers are followed
-std::unordered_map<uint64_t, resource_view> g_uavs;    // our UAVs for clearing history
+std::unordered_map<uint64_t, resource_view> g_uavs;    // our UAVs (history clear, centre pass)
+std::unordered_map<uint64_t, resource_view> g_srvs;    // our SRVs (centre pass)
 
 // Experiments (overlay, live)
 std::atomic<bool> g_skip[kPassCount] = {};
 std::atomic<bool> g_blurCopy{false};
-std::atomic<bool> g_blurCopySwap{false};
 std::atomic<bool> g_clearHistory{false};
 // All of the GI denoiser off at once: history cleared, mips + gap fix skipped, blur -> copy.
 std::atomic<bool> g_denoiserOff{false};
@@ -207,6 +209,116 @@ bool CopyTex(command_list* cl, resource src, resource_usage srcState, resource d
     return true;
 }
 
+// Our view of mip 0 of a game texture (cached until the texture is destroyed).
+resource_view CachedView(device* dev, resource r, bool uav) {
+    auto& views = uav ? g_uavs : g_srvs;
+    {
+        std::lock_guard<std::mutex> lock(g_mapMutex);
+        auto it = views.find(r.handle);
+        if (it != views.end()) return it->second;
+    }
+    const resource_desc d = dev->get_resource_desc(r);
+    if (uav && (d.usage & resource_usage::unordered_access) == 0) return {0};
+    resource_view v = {0};
+    const resource_view_desc vd(resource_view_type::texture_2d, d.texture.format, 0, 1, 0, 1);
+    if (!dev->create_resource_view(r, uav ? resource_usage::unordered_access : resource_usage::shader_resource, vd, &v)) return {0};
+    std::lock_guard<std::mutex> lock(g_mapMutex);
+    views[r.handle] = v;
+    return v;
+}
+
+// ---------------------------------------------------------------- centre-only GI output pass
+
+pipeline_layout g_centreLayout = {0};
+pipeline g_centrePipe = {0};
+bool g_centreFailed = false;
+std::atomic<uint64_t> g_centreRuns{0};
+std::string g_centreError;
+
+bool CreateCentrePipeline(device* dev) {
+    if (g_centrePipe.handle) return true;
+    if (g_centreFailed) return false;
+    descriptor_range srv = {};
+    srv.count = 2;
+    srv.visibility = shader_stage::all_compute;
+    srv.type = descriptor_type::shader_resource_view;
+    descriptor_range uav = {};
+    uav.count = 2;
+    uav.visibility = shader_stage::all_compute;
+    uav.type = descriptor_type::unordered_access_view;
+    const pipeline_layout_param params[2] = {pipeline_layout_param(srv), pipeline_layout_param(uav)};
+    shader_desc cs = {};
+    cs.code = kGiCenterCs;
+    cs.code_size = sizeof(kGiCenterCs);
+    pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+    if (!dev->create_pipeline_layout(2, params, &g_centreLayout) || !dev->create_pipeline(g_centreLayout, 1, &sub, &g_centrePipe)) {
+        g_centreFailed = true;
+        g_centreError = "couldn't create the centre-only GI shader";
+        Log("%s", g_centreError.c_str());
+        return false;
+    }
+    Log("centre-only GI shader created");
+    return true;
+}
+
+// Puts the game's compute bindings back: an empty bind makes ReShade set the game's root
+// signature (and descriptor heaps) again.
+void RestoreCompute(command_list* cl, const ListState& st) {
+    if (st.layout.handle) {
+        cl->bind_descriptor_tables(shader_stage::all_compute, st.layout, 0, 0, nullptr);
+        for (uint32_t i = 0; i < 8; ++i)
+            if (st.tables[i].handle) cl->bind_descriptor_tables(shader_stage::all_compute, st.layout, i, 1, &st.tables[i]);
+        for (uint32_t i = 0; i < 8; ++i) {
+            if (!st.cbv[i].buffer.handle) continue;
+            descriptor_table_update u = {};
+            u.count = 1;
+            u.type = descriptor_type::constant_buffer;
+            u.descriptors = &st.cbv[i];
+            cl->push_descriptors(shader_stage::all_compute, st.layout, i, u);
+        }
+    }
+    if (st.pipe.handle) cl->bind_pipeline(pipeline_stage::all_compute, st.pipe);
+}
+
+void CentreFail(const std::string& why) {
+    if (g_centreError != why) Log("centre-only GI pass not run: %s", why.c_str());
+    g_centreError = why;
+}
+
+bool RunCentre(command_list* cl, const ListState& st, const BindingMap& m) {
+    device* dev = cl->get_device();
+    if (!CreateCentrePipeline(dev)) return false;
+    const resource inA = Find(m, "t3"), inB = Find(m, "t4"), outA = Find(m, "u0"), outB = Find(m, "u1");
+    if (!inA.handle || !inB.handle || !outA.handle || !outB.handle) return CentreFail("blur bindings missing"), false;
+    resource_usage s[4];
+    {
+        std::lock_guard<std::mutex> lock(g_mapMutex);
+        s[0] = StateOf(inA), s[1] = StateOf(inB), s[2] = StateOf(outA), s[3] = StateOf(outB);
+    }
+    // The game has just moved the inputs to non-pixel SRV and the outputs to UAV for its blur.
+    if (s[0] != resource_usage::shader_resource_non_pixel || s[1] != resource_usage::shader_resource_non_pixel ||
+        s[2] != resource_usage::unordered_access || s[3] != resource_usage::unordered_access)
+        return CentreFail(Format("unexpected states %x %x %x %x", (unsigned)s[0], (unsigned)s[1], (unsigned)s[2], (unsigned)s[3])), false;
+    const resource_view srvs[2] = {CachedView(dev, inA, false), CachedView(dev, inB, false)};
+    const resource_view uavs[2] = {CachedView(dev, outA, true), CachedView(dev, outB, true)};
+    if (!srvs[0].handle || !srvs[1].handle || !uavs[0].handle || !uavs[1].handle) return CentreFail("views"), false;
+    const resource_desc d = dev->get_resource_desc(outA);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_centrePipe);
+    descriptor_table_update u = {};
+    u.count = 2;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = srvs;
+    cl->push_descriptors(shader_stage::all_compute, g_centreLayout, 0, u);
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = uavs;
+    cl->push_descriptors(shader_stage::all_compute, g_centreLayout, 1, u);
+    cl->dispatch((d.texture.width + 7) / 8, (d.texture.height + 7) / 8, 1);
+    RestoreCompute(cl, st);
+    if (g_centreRuns++ == 0) Log("centre-only GI pass ran (first time)");
+    g_centreError.clear();
+    return true;
+}
+
 bool ClearTex(command_list* cl, resource r, resource_usage state) {
     if (state == resource_usage::undefined) return false;
     device* dev = cl->get_device();
@@ -243,7 +355,9 @@ void OnBindPipeline(command_list* cl, pipeline_stage stages, pipeline pipe) {
     if ((stages & pipeline_stage::compute_shader) == 0) return;
     const uint32_t cs = ComputeShaderId(pipe.handle);
     std::lock_guard<std::mutex> lock(g_listMutex);
-    g_listState[cl->get_native()].cs = cs;
+    ListState& st = g_listState[cl->get_native()];
+    st.cs = cs;
+    st.pipe = pipe;
 }
 
 void OnBindTables(command_list* cl, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count,
@@ -281,10 +395,12 @@ void OnDestroyResource(device*, resource r) {
     std::lock_guard<std::mutex> lock(g_mapMutex);
     g_tracked.erase(r.handle);
     g_state.erase(r.handle);
-    auto it = g_uavs.find(r.handle);
-    if (it != g_uavs.end()) {
-        if (device* dev = CurrentDevice()) dev->destroy_resource_view(it->second);
-        g_uavs.erase(it);
+    for (auto* views : {&g_uavs, &g_srvs}) {
+        auto it = views->find(r.handle);
+        if (it != views->end()) {
+            if (device* dev = CurrentDevice()) dev->destroy_resource_view(it->second);
+            views->erase(it);
+        }
     }
 }
 
@@ -340,20 +456,9 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
         }
     }
     if (pass == kGiBlur && BlurCopyOn()) {
-        const bool swap = g_blurCopySwap.load();
-        const resource in0 = Find(m, swap ? "t4" : "t3"), in1 = Find(m, swap ? "t3" : "t4");
-        const resource out0 = Find(m, "u0"), out1 = Find(m, "u1");
-        if (in0.handle && in1.handle && out0.handle && out1.handle) {
-            resource_usage s[4];
-            {
-                std::lock_guard<std::mutex> lock(g_mapMutex);
-                s[0] = StateOf(in0), s[1] = StateOf(in1), s[2] = StateOf(out0), s[3] = StateOf(out1);
-            }
-            const bool ok = CopyTex(cl, in0, s[0], out0, s[2]) && CopyTex(cl, in1, s[1], out1, s[3]);
-            if (ok) {
-                ++g_actions;
-                return true;  // the copies replace the blur
-            }
+        if (RunCentre(cl, st, m)) {
+            ++g_actions;
+            return true;  // the centre-only pass replaces the blur
         }
     }
     if (kPasses[pass].skippable && SkipOn(pass)) {
@@ -572,7 +677,14 @@ void OnDestroyDevice(device* dev) {
     DestroyView(dev);
     std::lock_guard<std::mutex> lock(g_mapMutex);
     for (auto& kv : g_uavs) dev->destroy_resource_view(kv.second);
+    for (auto& kv : g_srvs) dev->destroy_resource_view(kv.second);
     g_uavs.clear();
+    g_srvs.clear();
+    if (g_centrePipe.handle) dev->destroy_pipeline(g_centrePipe);
+    if (g_centreLayout.handle) dev->destroy_pipeline_layout(g_centreLayout);
+    g_centrePipe = {0};
+    g_centreLayout = {0};
+    g_centreFailed = false;
 }
 
 void RequestDump() { g_dumpRequested = true; }
@@ -599,10 +711,9 @@ void DrawOverlay() {
     v = g_clearHistory.load();
     if (ImGui::Checkbox("GI: clear history before the temporal pass", &v)) g_clearHistory = v;
     v = g_blurCopy.load();
-    if (ImGui::Checkbox("GI: replace the final spatial blur with a copy", &v)) g_blurCopy = v;
-    ImGui::SameLine();
-    v = g_blurCopySwap.load();
-    if (ImGui::Checkbox("swap inputs", &v)) g_blurCopySwap = v;
+    if (ImGui::Checkbox("GI: replace the final spatial blur with the centre sample only", &v)) g_blurCopy = v;
+    if (!g_centreError.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%s", g_centreError.c_str());
+    ImGui::TextDisabled("centre-only passes run: %llu", g_centreRuns.load());
     for (int i = 0; i < kPassCount; ++i) {
         if (!kPasses[i].skippable) continue;
         v = g_skip[i].load();

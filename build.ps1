@@ -26,8 +26,9 @@ $addon = "$root\bin\MetroExodusRR.addon64"
 # (no NVIDIA library is linked): the game's own DLSS calls are wrapped.
 $cmd = @(
     "call `"$vcvars`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGiCenterCs /Fh `"$obj\gi_center_cs.h`" `"$root\src\gi_center.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
-     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
+     "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" /I `"$obj`" " +
      "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\src\ngx.cpp`" `"$root\src\rt.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" user32.lib " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\MetroExodusRR.pdb`" /DEBUG")
 ) -join " && "
