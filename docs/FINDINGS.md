@@ -99,6 +99,32 @@ writes each pass's root CBV to `MetroExodusRR-cb-<pass>-p<param>.bin`. Overlay: 
 bound texture of a known pass (copied on the present queue, state from the last observed
 barrier; per-mip barriers aren't distinguished, so mip-chain states are a guess).
 
+### 0.0.2 run (2026-11-20, analysis/run2): binding maps
+
+No crash; all ten known passes seen with the same shader ids. GI data flow (resource ids differ
+per run):
+- gi-prep: G-buffer (t1 rgba8srgb RT0, t2 rgb10a2 normals RT1, t3 rgba8srgb RT2, t4 depth, blue
+  noise 64x64x64) -> u1 rg16snorm = **ray direction** (octahedral), u2 r32uint, u0 r32uint.
+- gi-trace: normals, depth, ray dir -> u0 r32uint hit data.
+- gi-hit-shading: hit data + ray dir + probe grid (8x9216 r32uint, 1584x144, 3168x288),
+  cubemaps, sun shadow maps (3x 4096^2) -> u0 **#raw rgba16f = noisy GI radiance + hit distance**.
+- gi-temporal: t0 MV, t1 ray dir, t2 depth, t3 r32f (history length/moments, ping-pong with u0),
+  t4 raw GI, **t5/t6 history = last frame's blur outputs** -> mips 0-2 of two rgba16f chains A/B.
+  Two rgba16f with the ray direction = GI stored as a directional encoding (SH-like, likely
+  YCoCg: A = luma, B = chroma); the composite evaluates it with the pixel normal.
+- gi-mips (mips 3-4), gi-gapfix (r32f t0 + chains, in place), gi-spatial-blur (normals, r32f,
+  chains A/B -> u0/u1 = the denoised GI = composite t9/t10 and next frame's history).
+- reflection-trace -> u0 **rgba32f reflection radiance**, read directly by the composite (t5):
+  reflections get **no spatial/temporal denoiser** of their own (DLSS SR cleans them up today).
+  rt-after-composite writes the same rgba32f again after the composite (next frame / transparents).
+- rt-composite: G-buffer RT0/RT1/RT2, depth, reflections, denoised GI A/B, cubemaps -> adds into
+  the two r11g11b10f lighting targets; DLSS colour is one of them (u0 here).
+
+Plan for "denoiser off" that keeps the game's own GI encoding: clear the temporal pass's history
+(t5/t6) and its r32f history length (t3) so it keeps only the current sample, skip gi-mips and
+gi-gapfix, and replace gi-spatial-blur by a copy of mip 0 of A/B. The composite then adds noisy
+1-sample GI + raw reflections, which is what Ray Reconstruction wants as colour input.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
