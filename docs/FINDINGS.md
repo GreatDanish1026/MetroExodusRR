@@ -276,6 +276,8 @@ Run 1 (analysis/run9): **RR works in the game's NGX session.** "Ray Reconstructi
 guides, frame count reset and centre pass all running. One "G-buffer state 0" on the very first
 composite (barrier not seen yet), fine from the next frame. Projection that run: P00 1.1547,
 P11 1.7321 (P00 differs from run2's 0.913: read live every frame, so fine).
+User verdict: the overlay showed "running: 2224x1248 -> 3840x2160" and **the picture looked good**
+(no smearing, colour or flicker problems reported).
 
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
