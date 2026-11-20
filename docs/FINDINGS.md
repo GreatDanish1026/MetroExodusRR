@@ -212,6 +212,39 @@ comes from the temporal pass itself when it gets single samples with no spatial 
 sweep now runs: game, spatial off, spatial off with cap 7/3/1/0, cap 0 with the spatial filter on.
 A small cap may give RR an almost-raw signal without the brightness loss.
 
+### 0.0.8 cap sweep (analysis/run8)
+
+| combination | lit u0 lum | vs game |
+|---|---|---|
+| game | 0.0360 | |
+| spatial off (centre + skips) | 0.0367 | +2 % |
+| spatial off, cap 7 | 0.0359 | -0.3 % |
+| **spatial off, cap 3** | 0.0354 | **-1.7 %** |
+| spatial off, cap 1 | 0.0344 | -4.4 % |
+| spatial off, cap 0 | 0.0317 | -12 % |
+| cap 0, spatial on | 0.0347 | -3.6 % |
+
+Decision: RR input = spatial filter off + frame count capped at **3** (default of the slider now):
+about four frames of history, unfiltered per pixel, within 2 % of the game's brightness.
+Reflections are already raw.
+
+## 0.1.0 plan: Ray Reconstruction
+
+1. RR DLL: `nvngx_dlssd.dll` next to MetroExodus.exe (copy from E:\CallistoDLSS release; NGX
+   loads feature DLLs from the app folder).
+2. In the Evaluate wrapper: create an RR feature (NVSDK_NGX_Feature_RayReconstruction) through
+   the driver's own CreateFeature/AllocateParameters that the game looked up (game's NGX session,
+   game's command list), same render/output size, flags HDR | MVLowRes | DepthInverted; evaluate
+   it instead of SR with the game's colour/depth/MV/jitter/exposure plus guides; SR kept as
+   fallback and A/B switch.
+3. Guides from the G-buffer (decoding still to read from gi-prep/composite): diffuse albedo
+   (RT0 rgba8srgb), normals (RT1 rgb10a2, *2-1; check view vs world space), roughness + specular
+   (RT2 rgba8srgb), specular albedo = F0 * env-BRDF approximation. A small compute pass writes
+   them into our own textures each frame before the evaluate.
+4. RR needs world-to-view and view-to-clip matrices: from the composite's root CBV (registers
+   17-20 reconstruct position from depth) — to be decoded from the F11 dumps.
+5. Denoiser off (cap 3 + skips + centre) is switched on together with RR.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and

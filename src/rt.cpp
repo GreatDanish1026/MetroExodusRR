@@ -102,7 +102,7 @@ std::atomic<bool> g_skip[kPassCount] = {};
 std::atomic<bool> g_blurCopy{false};
 std::atomic<bool> g_clearHistory{false};  // breaks the GI (count kept, history black): kept for reference
 std::atomic<bool> g_resetCount{false};    // frame count of the temporal pass's t3 capped
-std::atomic<int> g_countCap{0};           // the cap (0 = current frame only, 31 = game)
+std::atomic<int> g_countCap{3};           // the cap (0 = current frame only, 31 = game); 3 keeps brightness (run8)
 // All of the GI denoiser off at once: history cleared, mips + gap fix skipped, blur -> copy.
 std::atomic<bool> g_denoiserOff{false};
 std::atomic<bool> g_measureRequested{false};
