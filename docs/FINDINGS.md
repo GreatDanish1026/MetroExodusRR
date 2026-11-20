@@ -245,6 +245,32 @@ Reflections are already raw.
    17-20 reconstruct position from depth) — to be decoded from the F11 dumps.
 5. Denoiser off (cap 3 + skips + centre) is switched on together with RR.
 
+### Camera and G-buffer (from the composite's code and CB dump, run2)
+
+Composite root CBV (param 1), column vectors: registers 7-9 = world->view 3x4 (translation in w),
+10-12 = view->world (rotation; camera position in w), 13-16 = projection (row 13 = 0.913, 0,
+jitter, 0; row 14 = 0, 1.732, jitter, 0; row 15 = 0, 0, -0.00009, 0.1; row 16 = 0, 0, 1, 0: view z
+forward, inverted depth with near 0.1, far = 0), 17-20 = inverse projection (clip -> view).
+G-buffer: RT0 rgb = diffuse albedo, a = (occlusion-like, >0.0118 used); RT1 rgb = **view-space**
+normal *0.5+0.5, a = material id/3 (id 2 = F0 0.05, id 3 = roughness tweak); RT2 r = gloss
+(roughness = 1 - r), gba = specular F0. Depth = D32S8 typeless, SRV as r32_float_x8.
+
+## 0.1.0: Ray Reconstruction (first build, untested)
+
+- rt.cpp RunGuides at the composite dispatch (graphics list, just before DLSS): guide.hlsl makes
+  diffuse albedo, env-BRDF specular albedo and world normal + roughness (rgba16f, render size);
+  the matrices for NGX are built from registers 7-9 (WorldToView, row-vector form) and 13-16
+  (ViewToClip = transpose, jitter removed).
+- rr.cpp: in the game's Evaluate, creates NVSDK_NGX_Feature_RayReconstruction in the game's NGX
+  session (driver CreateFeature, own AllocateParameters block; game's flags 0xb and quality, HW
+  depth, packed roughness) and evaluates it with the game's colour/depth/MV/jitter/exposure/output
+  instead of the SR call; any failure -> the game's SR runs. NVSDK_NGX_Parameter_Set* and
+  CreateFeature/EvaluateFeature_C are defined in rr.cpp on top of the driver so NVIDIA's helper
+  macros work without the NGX library.
+- While RR runs, the GI denoiser is off (cap 3 + skips + centre pass).
+- nvngx_dlssd.dll 310.9.16 copied next to the exe by build.ps1 -Install (from CallistoDLSS 1.0.3).
+- Open risk: the game's NGX is SDK rel_1_6 (old); the driver may refuse RR in that session.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and

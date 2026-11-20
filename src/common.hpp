@@ -31,6 +31,20 @@ void Unregister();
 void OnDestroyDevice(reshade::api::device* dev);
 void RequestDump();  // F11: binding maps + constant buffers of the known passes
 void DrawOverlay();
+
+// Ray Reconstruction guides made at the RT composite pass (render size, native ID3D12Resource*),
+// and the camera of that frame as NGX wants it (row-major, row vectors).
+struct Guides {
+    void* diffuse;
+    void* specular;
+    void* normals;  // world normal, roughness in w
+    float worldToView[16];
+    float viewToClip[16];
+    uint64_t seq;  // increments with each new set
+};
+bool LatestGuides(Guides* out);
+bool RrWanted();              // overlay switch
+void SetRrWorking(bool on);   // rr.cpp: RR ran this frame (turns the game's GI denoiser off)
 }  // namespace rt
 
 namespace ngx {
@@ -38,4 +52,16 @@ void Install();    // hooks GetProcAddress in MetroExodus.exe's import table
 void Uninstall();  // restores it; the game's NGX pointers fall back to the driver's functions
 void OnPresent();  // periodic summary
 std::string Status();
+enum DriverFn { kDriverCreate, kDriverEvaluate, kDriverRelease };
+void* DriverFunction(int which);       // the driver's Create/Evaluate/Release the game looked up
+void* DriverProc(const char* name);    // any other NVSDK_NGX_D3D12_* of the driver's NGX module
+unsigned GameCreateFlags();            // the game's DLSS create flags
+int GameQuality();                     // the game's DLSS PerfQualityValue
 }  // namespace ngx
+
+// Ray Reconstruction in place of the game's DLSS Super Resolution (rr.cpp).
+namespace rr {
+bool Evaluate(void* commandList, const void* gameParams);  // true = RR ran, skip the game's call
+void OnGameRelease();
+std::string Status();
+}  // namespace rr

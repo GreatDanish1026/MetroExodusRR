@@ -33,6 +33,7 @@
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
 #include "gi_center_cs.h"    // kGiCenterCs, built from gi_center.hlsl
 #include "count_reset_cs.h"  // kCountResetCs, built from count_reset.hlsl
+#include "guide_cs.h"        // kGuideCs, built from guide.hlsl
 #include "common.hpp"
 #include "version.h"
 
@@ -108,10 +109,14 @@ std::atomic<bool> g_denoiserOff{false};
 std::atomic<bool> g_measureRequested{false};
 std::atomic<bool> g_dumpRequested{false};
 
+std::atomic<bool> g_rrWanted{true};    // overlay: Ray Reconstruction instead of the game's DLSS
+std::atomic<bool> g_rrWorking{false};  // rr.cpp: RR ran last frame
+// RR needs the GI noisy: the denoiser goes off while RR runs.
+bool DenoiserOff() { return g_denoiserOff.load() || (g_rrWanted.load() && g_rrWorking.load()); }
 bool ClearHistoryOn() { return g_clearHistory.load(); }
-bool ResetCountOn() { return g_resetCount.load() || g_denoiserOff.load(); }
-bool BlurCopyOn() { return g_blurCopy.load() || g_denoiserOff.load(); }
-bool SkipOn(int pass) { return g_skip[pass].load() || (g_denoiserOff.load() && (pass == kGiMips || pass == kGiGapFix)); }
+bool ResetCountOn() { return g_resetCount.load() || DenoiserOff(); }
+bool BlurCopyOn() { return g_blurCopy.load() || DenoiserOff(); }
+bool SkipOn(int pass) { return g_skip[pass].load() || (DenoiserOff() && (pass == kGiMips || pass == kGiGapFix)); }
 std::atomic<bool> g_dumpPending[kPassCount] = {};
 std::atomic<uint64_t> g_actions{0};  // experiment actions done (for the overlay)
 
@@ -214,7 +219,7 @@ bool CopyTex(command_list* cl, resource src, resource_usage srcState, resource d
 }
 
 // Our view of mip 0 of a game texture (cached until the texture is destroyed).
-resource_view CachedView(device* dev, resource r, bool uav) {
+resource_view CachedView(device* dev, resource r, bool uav, format fmt = format::unknown) {
     auto& views = uav ? g_uavs : g_srvs;
     {
         std::lock_guard<std::mutex> lock(g_mapMutex);
@@ -224,7 +229,7 @@ resource_view CachedView(device* dev, resource r, bool uav) {
     const resource_desc d = dev->get_resource_desc(r);
     if (uav && (d.usage & resource_usage::unordered_access) == 0) return {0};
     resource_view v = {0};
-    const resource_view_desc vd(resource_view_type::texture_2d, d.texture.format, 0, 1, 0, 1);
+    const resource_view_desc vd(resource_view_type::texture_2d, fmt != format::unknown ? fmt : d.texture.format, 0, 1, 0, 1);
     if (!dev->create_resource_view(r, uav ? resource_usage::unordered_access : resource_usage::shader_resource, vd, &v)) return {0};
     std::lock_guard<std::mutex> lock(g_mapMutex);
     views[r.handle] = v;
@@ -388,6 +393,163 @@ bool RunCountReset(command_list* cl, const ListState& st, const BindingMap& m) {
     return true;
 }
 
+// ---------------------------------------------------------------- Ray Reconstruction guides
+
+pipeline_layout g_guideLayout = {0};
+pipeline g_guidePipe = {0};
+bool g_guideFailed = false;
+resource g_guideTex[3] = {};
+resource_view g_guideUav[3] = {};
+uint32_t g_guideW = 0, g_guideH = 0;
+std::vector<resource> g_guideRetired;  // old-size guides, destroyed with the device
+std::mutex g_guideMutex;               // g_guides
+rt::Guides g_guides = {};
+bool g_guidesValid = false;
+std::atomic<uint64_t> g_guideRuns{0};
+std::string g_guideError;
+
+void GuideFail(const std::string& why) {
+    if (g_guideError != why) Log("RR guides not made: %s", why.c_str());
+    g_guideError = why;
+}
+
+// <count> floats at byte <offset> of the dispatch's root constant buffer <param>.
+bool ReadCb(device* dev, const ListState& st, uint32_t param, uint32_t offset, float* out, uint32_t count) {
+    const buffer_range& b = st.cbv[param];
+    if (!b.buffer.handle) return false;
+    const resource_desc bd = dev->get_resource_desc(b.buffer);
+    if (bd.type != resource_type::buffer || b.offset + offset + count * 4ull > bd.buffer.size) return false;
+    void* data = nullptr;
+    if (!dev->map_buffer_region(b.buffer, b.offset + offset, count * 4, map_access::read_only, &data) || !data) return false;
+    std::memcpy(out, data, count * 4);
+    dev->unmap_buffer_region(b.buffer);
+    return true;
+}
+
+bool EnsureGuideTextures(device* dev, uint32_t w, uint32_t h) {
+    if (g_guideTex[0].handle && g_guideW == w && g_guideH == h) return true;
+    for (int i = 0; i < 3; ++i) {
+        if (g_guideUav[i].handle) dev->destroy_resource_view(g_guideUav[i]);
+        if (g_guideTex[i].handle) g_guideRetired.push_back(g_guideTex[i]);
+        g_guideTex[i] = {0};
+        g_guideUav[i] = {0};
+    }
+    for (int i = 0; i < 3; ++i) {
+        const resource_desc d(w, h, 1, 1, format::r16g16b16a16_float, 1, memory_heap::default_,
+                              resource_usage::unordered_access | resource_usage::shader_resource);
+        if (!dev->create_resource(d, nullptr, resource_usage::shader_resource, &g_guideTex[i]) ||
+            !dev->create_resource_view(g_guideTex[i], resource_usage::unordered_access,
+                                       resource_view_desc(format::r16g16b16a16_float), &g_guideUav[i]))
+            return false;
+    }
+    g_guideW = w, g_guideH = h;
+    Log("RR guide textures created: %ux%u", w, h);
+    return true;
+}
+
+bool IsSrvState(resource_usage u) { return (static_cast<uint32_t>(u) & static_cast<uint32_t>(resource_usage::shader_resource_non_pixel)) != 0; }
+
+// At the RT composite dispatch: the G-buffer and depth are bound as its t2/t3/t4/t8, and its root
+// CBV holds the camera (registers 7-9 world->view 3x4, 10-12 view->world rotation, 13-16 projection
+// with jitter in [0][2]/[1][2]; column vectors).
+bool RunGuides(command_list* cl, const ListState& st, const BindingMap& m) {
+    device* dev = cl->get_device();
+    if (!g_guidePipe.handle && !g_guideFailed) {
+        descriptor_range srv = {};
+        srv.count = 4;
+        srv.visibility = shader_stage::all_compute;
+        srv.type = descriptor_type::shader_resource_view;
+        descriptor_range uav = {};
+        uav.count = 3;
+        uav.visibility = shader_stage::all_compute;
+        uav.type = descriptor_type::unordered_access_view;
+        constant_range c = {};
+        c.count = 16;
+        c.visibility = shader_stage::all_compute;
+        const pipeline_layout_param params[3] = {pipeline_layout_param(srv), pipeline_layout_param(uav), pipeline_layout_param(c)};
+        shader_desc cs = {};
+        cs.code = kGuideCs;
+        cs.code_size = sizeof(kGuideCs);
+        pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+        if (!dev->create_pipeline_layout(3, params, &g_guideLayout) || !dev->create_pipeline(g_guideLayout, 1, &sub, &g_guidePipe)) {
+            g_guideFailed = true;
+            GuideFail("couldn't create the guide shader");
+        } else {
+            Log("RR guide shader created");
+        }
+    }
+    if (!g_guidePipe.handle) return false;
+    const resource g0 = Find(m, "t2"), g1 = Find(m, "t3"), g2 = Find(m, "t4"), depth = Find(m, "t8");
+    if (!g0.handle || !g1.handle || !g2.handle || !depth.handle) return GuideFail("composite bindings missing"), false;
+    {
+        std::lock_guard<std::mutex> lock(g_mapMutex);
+        const resource_usage s[4] = {StateOf(g0), StateOf(g1), StateOf(g2), StateOf(depth)};
+        for (int i = 0; i < 4; ++i)
+            if (!IsSrvState(s[i])) return GuideFail(Format("G-buffer state %x", static_cast<unsigned>(s[i]))), false;
+    }
+    float c[40];  // registers 7..16
+    if (!ReadCb(dev, st, 1, 7 * 16, c, 40)) return GuideFail("couldn't read the composite's constants"), false;
+    const resource_desc gd = dev->get_resource_desc(g0);
+    const uint32_t w = gd.texture.width, h = gd.texture.height;
+    if (!EnsureGuideTextures(dev, w, h)) return GuideFail("couldn't create the guide textures"), false;
+    const resource_view srvs[4] = {CachedView(dev, g0, false), CachedView(dev, g1, false), CachedView(dev, g2, false),
+                                   CachedView(dev, depth, false, format::r32_float_x8_uint)};
+    for (const resource_view& v : srvs)
+        if (!v.handle) return GuideFail("G-buffer views"), false;
+
+    const float* A = c;       // world -> view, rows 7-9 (xyz rotation, w translation)
+    const float* R = c + 12;  // view -> world rotation, rows 10-12
+    const float* P = c + 24;  // projection, rows 13-16
+    float pc[16] = {R[0], R[1], R[2], 0, R[4], R[5], R[6], 0, R[8], R[9], R[10], 0,
+                    1.0f / P[0], 1.0f / P[5], 1.0f / w, 1.0f / h};
+
+    const resource_usage from[3] = {resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::shader_resource};
+    const resource_usage to[3] = {resource_usage::unordered_access, resource_usage::unordered_access, resource_usage::unordered_access};
+    cl->barrier(3, g_guideTex, from, to);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_guidePipe);
+    descriptor_table_update u = {};
+    u.count = 4;
+    u.type = descriptor_type::shader_resource_view;
+    u.descriptors = srvs;
+    cl->push_descriptors(shader_stage::all_compute, g_guideLayout, 0, u);
+    u.count = 3;
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = g_guideUav;
+    cl->push_descriptors(shader_stage::all_compute, g_guideLayout, 1, u);
+    cl->push_constants(shader_stage::all_compute, g_guideLayout, 2, 0, 16, pc);
+    cl->dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    cl->barrier(3, g_guideTex, to, from);
+    RestoreCompute(cl, st);
+
+    // NGX matrices: row-major, row vectors (v_row * M).
+    rt::Guides gd2 = {};
+    // world -> view: view = A_rot * world + t  =>  M[i][j] = A[j][i], translation in row 3.
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) gd2.worldToView[i * 4 + j] = A[j * 4 + i];
+    for (int j = 0; j < 3; ++j) gd2.worldToView[12 + j] = A[j * 4 + 3];
+    gd2.worldToView[15] = 1;
+    // view -> clip: the transpose of the projection, without the jitter terms.
+    float Pn[16];
+    std::memcpy(Pn, P, sizeof(Pn));
+    Pn[2] = 0, Pn[6] = 0;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) gd2.viewToClip[i * 4 + j] = Pn[j * 4 + i];
+    gd2.diffuse = reinterpret_cast<void*>(g_guideTex[0].handle);
+    gd2.specular = reinterpret_cast<void*>(g_guideTex[1].handle);
+    gd2.normals = reinterpret_cast<void*>(g_guideTex[2].handle);
+    {
+        std::lock_guard<std::mutex> lock(g_guideMutex);
+        gd2.seq = g_guides.seq + 1;
+        g_guides = gd2;
+        g_guidesValid = true;
+    }
+    if (g_guideRuns++ == 0) {
+        Log("RR guides made (first time): %ux%u, P00 %.4f P11 %.4f, camera at %.2f %.2f %.2f", w, h, P[0], P[5], R[3], R[7], R[11]);
+    }
+    g_guideError.clear();
+    return true;
+}
+
 bool ClearTex(command_list* cl, resource r, resource_usage state) {
     if (state == resource_usage::undefined) return false;
     device* dev = cl->get_device();
@@ -503,6 +665,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     if (first || dump) LogMap(pass, m);
     if (dump) DumpConstants(dev, pass, st);
 
+    if (pass == kComposite && g_rrWanted.load()) RunGuides(cl, st, m);
     if (pass == kGiTemporal && ResetCountOn() && RunCountReset(cl, st, m)) ++g_actions;
     if (pass == kGiTemporal && ClearHistoryOn()) {
         // History = inputs of the temporal pass that the final blur wrote last frame.
@@ -831,6 +994,24 @@ void OnDestroyDevice(device* dev) {
     for (auto& kv : g_srvs) dev->destroy_resource_view(kv.second);
     g_uavs.clear();
     g_srvs.clear();
+    for (int i = 0; i < 3; ++i) {
+        if (g_guideUav[i].handle) dev->destroy_resource_view(g_guideUav[i]);
+        if (g_guideTex[i].handle) dev->destroy_resource(g_guideTex[i]);
+        g_guideUav[i] = {0};
+        g_guideTex[i] = {0};
+    }
+    for (resource r : g_guideRetired) dev->destroy_resource(r);
+    g_guideRetired.clear();
+    g_guideW = g_guideH = 0;
+    if (g_guidePipe.handle) dev->destroy_pipeline(g_guidePipe);
+    if (g_guideLayout.handle) dev->destroy_pipeline_layout(g_guideLayout);
+    g_guidePipe = {0};
+    g_guideLayout = {0};
+    g_guideFailed = false;
+    {
+        std::lock_guard<std::mutex> glock(g_guideMutex);
+        g_guidesValid = false;
+    }
     if (g_resetPipe.handle) dev->destroy_pipeline(g_resetPipe);
     if (g_resetLayout.handle) dev->destroy_pipeline_layout(g_resetLayout);
     g_resetPipe = {0};
@@ -844,6 +1025,17 @@ void OnDestroyDevice(device* dev) {
 }
 
 void RequestDump() { g_dumpRequested = true; }
+
+bool LatestGuides(Guides* out) {
+    std::lock_guard<std::mutex> lock(g_guideMutex);
+    if (!g_guidesValid) return false;
+    *out = g_guides;
+    return true;
+}
+
+bool RrWanted() { return g_rrWanted.load(); }
+
+void SetRrWorking(bool on) { g_rrWorking = on; }
 
 void DrawOverlay() {
     if (!ImGui::CollapsingHeader("Ray tracing passes (experiments)", ImGuiTreeNodeFlags_DefaultOpen)) return;
@@ -860,6 +1052,12 @@ void DrawOverlay() {
         ImGui::BulletText("%s (cs%08x): %s", kPasses[i].name, kPasses[i].cs,
                           !seen ? "never" : age <= 2 ? Format("active, %u dispatch(es)", m.dispatches).c_str() : "not this frame");
     }
+    ImGui::Separator();
+    bool rrOn = g_rrWanted.load();
+    if (ImGui::Checkbox("Ray Reconstruction (instead of the game's DLSS)", &rrOn)) g_rrWanted = rrOn;
+    ImGui::TextDisabled("RR: %s", rr::Status().c_str());
+    ImGui::TextDisabled("guides made: %llu%s%s", g_guideRuns.load(), g_guideError.empty() ? "" : ", ", g_guideError.c_str());
+    ImGui::TextDisabled("GI denoiser: %s", DenoiserOff() ? "OFF (noisy GI for RR)" : "game's");
     ImGui::Separator();
     bool v = g_denoiserOff.load();
     if (ImGui::Checkbox("GI denoiser OFF (all of the below at once)", &v)) g_denoiserOff = v;

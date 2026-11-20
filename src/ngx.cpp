@@ -44,6 +44,7 @@ struct Persistent {
     void* original[kFnCount];  // the driver's functions (0 until the game looks them up)
     void* target[kFnCount];    // where each stub jumps: the add-on's wrapper or the original
     alignas(16) uint8_t code[kFnCount][16];
+    HMODULE module;  // the driver's NGX module the game looks functions up in
 };
 constexpr uint32_t kMagic = 0x52525845;  // "EXRR"
 Persistent* g_p = nullptr;
@@ -64,6 +65,8 @@ std::string g_lastSignature;
 std::set<void*> g_seen[4];  // colour, output, depth, motion vectors
 std::vector<std::string> g_jitters;
 std::set<DWORD> g_threads;
+std::atomic<unsigned> g_gameFlags{0xb};   // the game's DLSS create flags (HDR | MVLowRes | DepthInverted)
+std::atomic<int> g_gameQuality{1};        // the game's PerfQualityValue
 float g_lastJitter[2] = {}, g_lastMvScale[2] = {};
 bool g_proxyList = false;
 
@@ -170,6 +173,11 @@ NVSDK_NGX_Result NVSDK_CONV WrapCreate(ID3D12GraphicsCommandList* cl, NVSDK_NGX_
     const std::string list = ListInfo(cl, &native);
     unsigned int flags = 0;
     if (p) p->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags);
+    if (p && id == NVSDK_NGX_Feature_SuperSampling && r == NVSDK_NGX_Result_Success) {
+        g_gameFlags = flags;
+        int q = 1;
+        if (p->Get(NVSDK_NGX_Parameter_PerfQualityValue, &q) == NVSDK_NGX_Result_Success) g_gameQuality = q;
+    }
     Log("NGX CreateFeature %d (%s) -> 0x%x, handle id %s, thread %lu, list %s", id, FeatureName(id), r,
         out && *out ? Format("%u", HandleId(*out)).c_str() : "-", GetCurrentThreadId(), list.c_str());
     if (p) {
@@ -269,6 +277,9 @@ NVSDK_NGX_Result NVSDK_CONV WrapEvaluate(ID3D12GraphicsCommandList* cl, const NV
                                        DescribeNative(res[3]).c_str(), g_lastJitter[0], g_lastJitter[1]));
         }
     }
+    // Ray Reconstruction in place of the game's Super Resolution (rr.cpp); falls through to the
+    // game's own call when RR is off or can't run this frame.
+    if (rr::Evaluate(cl, p)) return NVSDK_NGX_Result_Success;
     auto real = reinterpret_cast<decltype(&WrapEvaluate)>(g_p->original[kEvaluate]);
     const NVSDK_NGX_Result r = real(cl, h, p, cb);
     if (NVSDK_NGX_FAILED(r)) Log("NGX EvaluateFeature failed: 0x%x", r);
@@ -277,6 +288,7 @@ NVSDK_NGX_Result NVSDK_CONV WrapEvaluate(ID3D12GraphicsCommandList* cl, const NV
 
 NVSDK_NGX_Result NVSDK_CONV WrapRelease(NVSDK_NGX_Handle* h) {
     const unsigned id = HandleId(h);
+    rr::OnGameRelease();  // sizes may change with the game's next feature
     auto real = reinterpret_cast<decltype(&WrapRelease)>(g_p->original[kRelease]);
     const NVSDK_NGX_Result r = real(h);
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -295,6 +307,7 @@ FARPROC WINAPI HookGetProcAddress(HMODULE module, LPCSTR name) {
     GetModuleFileNameA(module, path, MAX_PATH);
     const char* file = std::strrchr(path, '\\');
     file = file ? file + 1 : path;
+    g_p->module = module;
     for (int i = 0; i < kFnCount; ++i) {
         if (std::strcmp(name, kFnNames[i]) != 0) continue;
         g_p->original[i] = reinterpret_cast<void*>(r);
@@ -390,6 +403,16 @@ void OnPresent() {
     g_presentsAtSummary = presents;
     g_evalsAtSummary = g_evaluates;
 }
+
+void* DriverFunction(int which) { return g_p && which >= 0 && which < kFnCount ? g_p->original[which] : nullptr; }
+
+void* DriverProc(const char* name) {
+    if (!g_p || !g_p->module || !g_realGpa) return nullptr;
+    return reinterpret_cast<void*>(g_realGpa(g_p->module, name));
+}
+
+unsigned GameCreateFlags() { return g_gameFlags.load(); }
+int GameQuality() { return g_gameQuality.load(); }
 
 std::string Status() {
     std::lock_guard<std::mutex> lock(g_mutex);
