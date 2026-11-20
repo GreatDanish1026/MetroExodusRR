@@ -125,6 +125,19 @@ Plan for "denoiser off" that keeps the game's own GI encoding: clear the tempora
 gi-gapfix, and replace gi-spatial-blur by a copy of mip 0 of A/B. The composite then adds noisy
 1-sample GI + raw reflections, which is what Ray Reconstruction wants as colour input.
 
+### 0.0.2 experiments (user, by eye)
+
+- Clear history: whole picture **darker**. Unexplained so far: the temporal pass keeps its
+  per-pixel frame count in the low mantissa bits of the history (chain B .x/.y low 4 bits, and the
+  r32f output = depth bits with count in the low 5 bits, count capped at 31); with count 0 the
+  blend weight works out to 1 (current sample only), which should be noisy, not darker.
+- Blur replaced by a copy: picture **noisy** (the spatial blur does most of the denoising).
+- Skipping temporal/mips/gapfix alone: no visible change (stale data stays in place).
+
+0.0.3: one "GI denoiser OFF" switch (all four at once) and a "measure brightness" button (average
+RGB of every rgba16f/rgba32f/r11g11b10f texture of the viewer's pass, logged) to check whether
+1-sample GI keeps the game's brightness.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
