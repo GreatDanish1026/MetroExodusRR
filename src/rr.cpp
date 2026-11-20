@@ -64,6 +64,7 @@ NVSDK_NGX_Handle* g_handle = nullptr;
 unsigned g_renderW = 0, g_renderH = 0, g_outW = 0, g_outH = 0;
 bool g_disabled = false;  // creation failed for these sizes: don't retry every frame
 uint64_t g_lastSeq = 0;
+int g_preset = -1;  // RR model hint the feature was created with
 uint64_t g_evaluates = 0;
 int g_failures = 0;
 std::string g_status = "waiting for the game's DLSS";
@@ -136,7 +137,8 @@ bool Evaluate(void* commandList, const void* gameParams) {
         }
     }
 
-    const bool sizesChanged = renderW != g_renderW || renderH != g_renderH || outW != g_outW || outH != g_outH;
+    const int preset = rt::RrPreset();
+    const bool sizesChanged = renderW != g_renderW || renderH != g_renderH || outW != g_outW || outH != g_outH || preset != g_preset;
     if (sizesChanged) g_disabled = false;
     if (g_disabled) return false;
     if (!g_handle || sizesChanged) {
@@ -152,6 +154,14 @@ bool Evaluate(void* commandList, const void* gameParams) {
         cp.InPerfQualityValue = static_cast<NVSDK_NGX_PerfQuality_Value>(ngx::GameQuality());
         cp.InFeatureCreateFlags = static_cast<int>(ngx::GameCreateFlags()) & ~NVSDK_NGX_DLSS_Feature_Flags_DoSharpening;
         cp.InEnableOutputSubrects = false;
+        const char* const presetKeys[] = {NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+                                          NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                                          NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                                          NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                                          NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                                          NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality};
+        for (const char* k : presetKeys) NVSDK_NGX_Parameter_SetUI(g_params, k, static_cast<unsigned>(preset));
+        g_preset = preset;
         const NVSDK_NGX_Result r = NGX_D3D12_CREATE_DLSSD_EXT(cl, 1, 1, &g_handle, g_params, &cp);
         g_renderW = renderW, g_renderH = renderH, g_outW = outW, g_outH = outH;
         if (NVSDK_NGX_FAILED(r) || !g_handle) {
@@ -160,8 +170,8 @@ bool Evaluate(void* commandList, const void* gameParams) {
             return Fail("couldn't create the Ray Reconstruction feature (" + ResultText(r) +
                         "); is nvngx_dlssd.dll next to MetroExodus.exe?");
         }
-        Log("Ray Reconstruction created: %ux%u -> %ux%u, quality %d, flags 0x%x", renderW, renderH, outW, outH,
-            ngx::GameQuality(), cp.InFeatureCreateFlags);
+        Log("Ray Reconstruction created: %ux%u -> %ux%u, quality %d, flags 0x%x, model hint %d", renderW, renderH, outW, outH,
+            ngx::GameQuality(), cp.InFeatureCreateFlags, preset);
         g_reset = true;
     }
 
@@ -202,7 +212,7 @@ bool Evaluate(void* commandList, const void* gameParams) {
     g_reset = false;
     g_lastSeq = g.seq;
     if (g_evaluates++ == 0) Log("Ray Reconstruction evaluated (first time)");
-    g_status = Format("running: %ux%u -> %ux%u", renderW, renderH, outW, outH);
+    g_status = Format("Ray Reconstruction running, %ux%u -> %ux%u", renderW, renderH, outW, outH);
     rt::SetRrWorking(true);
     return true;
 }
@@ -211,6 +221,7 @@ void OnGameRelease() {
     std::lock_guard<std::mutex> lock(g_mutex);
     ReleaseFeature();
     g_renderW = g_renderH = g_outW = g_outH = 0;
+    g_preset = -1;
     g_disabled = false;
     rt::SetRrWorking(false);
 }

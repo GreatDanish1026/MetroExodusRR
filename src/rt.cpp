@@ -110,6 +110,7 @@ std::atomic<bool> g_measureRequested{false};
 std::atomic<bool> g_dumpRequested{false};
 
 std::atomic<bool> g_rrWanted{true};    // overlay: Ray Reconstruction instead of the game's DLSS
+std::atomic<int> g_rrPreset{0};        // RR model hint: 0 NVIDIA default, 4 D, 5 E
 std::atomic<bool> g_rrWorking{false};  // rr.cpp: RR ran last frame
 // RR needs the GI noisy: the denoiser goes off while RR runs.
 bool DenoiserOff() { return g_denoiserOff.load() || (g_rrWanted.load() && g_rrWorking.load()); }
@@ -1035,10 +1036,64 @@ bool LatestGuides(Guides* out) {
 
 bool RrWanted() { return g_rrWanted.load(); }
 
+int RrPreset() { return g_rrPreset.load(); }
+
 void SetRrWorking(bool on) { g_rrWorking = on; }
 
-void DrawOverlay() {
-    if (!ImGui::CollapsingHeader("Ray tracing passes (experiments)", ImGuiTreeNodeFlags_DefaultOpen)) return;
+// ---------------------------------------------------------------- settings (ReShade.ini [MetroExodusRR])
+
+const char* const kRrModelNames[] = {"NVIDIA default", "D (transformer)", "E (latest transformer)"};
+const int kRrModelValues[] = {0, 4, 5};
+
+void LoadSettings() {
+    bool rrOn = true;
+    if (reshade::get_config_value(nullptr, MD_PRODUCT, "RayReconstruction", rrOn)) g_rrWanted = rrOn;
+    int preset = 0;
+    if (reshade::get_config_value(nullptr, MD_PRODUCT, "RRModel", preset) && (preset == 0 || preset == 4 || preset == 5))
+        g_rrPreset = preset;
+    int frames = 3;
+    if (reshade::get_config_value(nullptr, MD_PRODUCT, "GiHistoryFrames", frames) && frames >= 0 && frames <= 31) g_countCap = frames;
+    Log("settings: Ray Reconstruction %s, RR model %d, GI history frames %d", g_rrWanted.load() ? "on" : "off", g_rrPreset.load(),
+        g_countCap.load());
+}
+
+void Tip(const char* text) {
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+void DrawSettings() {
+    bool rrOn = g_rrWanted.load();
+    if (ImGui::Checkbox("Ray Reconstruction", &rrOn)) {
+        g_rrWanted = rrOn;
+        reshade::set_config_value(nullptr, MD_PRODUCT, "RayReconstruction", rrOn);
+    }
+    Tip("DLSS Ray Reconstruction in place of the game's DLSS: one AI model denoises the ray-traced global\n"
+        "illumination and reflections and upscales. The game's GI denoiser is switched off while it runs.\n"
+        "Off: the game's own DLSS and denoiser, unchanged. Needs DLSS selected in the game's options.");
+    int idx = 0;
+    for (int i = 0; i < 3; ++i)
+        if (kRrModelValues[i] == g_rrPreset.load()) idx = i;
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::Combo("Ray Reconstruction model", &idx, kRrModelNames, 3)) {
+        g_rrPreset = kRrModelValues[idx];
+        reshade::set_config_value(nullptr, MD_PRODUCT, "RRModel", g_rrPreset.load());
+    }
+    Tip("NVIDIA default lets the driver pick. D and E are the transformer models; E is the newest.");
+    int cap = g_countCap.load();
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::SliderInt("GI history frames", &cap, 0, 8)) {
+        g_countCap = cap;
+        reshade::set_config_value(nullptr, MD_PRODUCT, "GiHistoryFrames", cap);
+    }
+    Tip("How many frames the game's own GI accumulation keeps before Ray Reconstruction (default 3).\n"
+        "Fewer: rawer GI for Ray Reconstruction, but the game's GI encoding loses brightness\n"
+        "(0 = about 12 % darker). More: less noise in, more lag in moving light.");
+    ImGui::TextDisabled("Status: %s", rr::Status().c_str());
+    ImGui::TextDisabled("Game's GI denoiser: %s", DenoiserOff() ? "off (Ray Reconstruction denoises)" : "on");
+}
+
+void DrawAdvanced() {
+    ImGui::TextDisabled("Guides made: %llu%s%s", g_guideRuns.load(), g_guideError.empty() ? "" : ", ", g_guideError.c_str());
     ImGui::TextDisabled("Passes seen:");
     for (int i = 0; i < kPassCount; ++i) {
         BindingMap m;
@@ -1053,12 +1108,6 @@ void DrawOverlay() {
                           !seen ? "never" : age <= 2 ? Format("active, %u dispatch(es)", m.dispatches).c_str() : "not this frame");
     }
     ImGui::Separator();
-    bool rrOn = g_rrWanted.load();
-    if (ImGui::Checkbox("Ray Reconstruction (instead of the game's DLSS)", &rrOn)) g_rrWanted = rrOn;
-    ImGui::TextDisabled("RR: %s", rr::Status().c_str());
-    ImGui::TextDisabled("guides made: %llu%s%s", g_guideRuns.load(), g_guideError.empty() ? "" : ", ", g_guideError.c_str());
-    ImGui::TextDisabled("GI denoiser: %s", DenoiserOff() ? "OFF (noisy GI for RR)" : "game's");
-    ImGui::Separator();
     bool v = g_denoiserOff.load();
     if (ImGui::Checkbox("GI denoiser OFF (all of the below at once)", &v)) g_denoiserOff = v;
     ImGui::TextDisabled("Individual experiments:");
@@ -1067,7 +1116,7 @@ void DrawOverlay() {
     ImGui::SameLine();
     int cap = g_countCap.load();
     ImGui::SetNextItemWidth(160);
-    if (ImGui::SliderInt("max frames of history", &cap, 0, 31)) g_countCap = cap;
+    if (ImGui::SliderInt("max frames of history", &cap, 0, 31)) g_countCap = cap;  // not saved: testing
     if (!g_resetError.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%s", g_resetError.c_str());
     ImGui::TextDisabled("frame count resets run: %llu", g_resetRuns.load());
     v = g_clearHistory.load();

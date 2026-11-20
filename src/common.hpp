@@ -30,7 +30,9 @@ void Register();
 void Unregister();
 void OnDestroyDevice(reshade::api::device* dev);
 void RequestDump();  // F11: binding maps + constant buffers of the known passes
-void DrawOverlay();
+void LoadSettings();  // ReShade.ini [MetroExodusRR]
+void DrawSettings();  // the user's settings
+void DrawAdvanced();  // testing tools
 
 // Ray Reconstruction guides made at the RT composite pass (render size, native ID3D12Resource*),
 // and the camera of that frame as NGX wants it (row-major, row vectors).
@@ -44,6 +46,7 @@ struct Guides {
 };
 bool LatestGuides(Guides* out);
 bool RrWanted();              // overlay switch
+int RrPreset();               // RR model hint (0 default, 4 D, 5 E)
 void SetRrWorking(bool on);   // rr.cpp: RR ran this frame (turns the game's GI denoiser off)
 }  // namespace rt
 

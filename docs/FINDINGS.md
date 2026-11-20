@@ -279,6 +279,14 @@ P11 1.7321 (P00 differs from run2's 0.913: read live every frame, so fine).
 User verdict: the overlay showed "running: 2224x1248 -> 3840x2160" and **the picture looked good**
 (no smearing, colour or flicker problems reported).
 
+## 1.0.0 (2026-11-20)
+
+Release build of 0.1.0: settings in ReShade.ini [MetroExodusRR] (RayReconstruction, RRModel 0/4/5
+= NVIDIA default / D / E, GiHistoryFrames default 3; changing the model recreates the feature),
+overlay = settings + status, testing tools under "Advanced"; compute shader files and the F10/F11
+hotkeys only with Debug=1. Release zip: add-on, nvngx_dlssd.dll 310.9.16 (signature checked by
+build.ps1), README, LICENSE, THIRD_PARTY_NOTICES.txt, licenses\NVIDIA-DLSS-LICENSE.txt.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and

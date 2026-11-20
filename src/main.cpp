@@ -2,8 +2,8 @@
 // will replace the game's ray-tracing denoisers and DLSS Super Resolution with DLSS Ray
 // Reconstruction.
 //
-// 0.0.2 adds live experiments on the game's ray-tracing denoiser (rt.cpp); with every experiment
-// off it still changes nothing. The probe parts:
+// Ray Reconstruction (rr.cpp, guides and denoiser control in rt.cpp). The probe parts kept as
+// testing tools (Advanced section; files and hotkeys only with Debug=1):
 // - ngx.cpp logs every call the game makes to DLSS (NGX) with all of its inputs.
 // - Every compute shader the game creates is saved once to MetroExodusRR-shaders\csXXXXXXXX.dxil
 //   (same id as in the capture) with its debug name in the log, so the denoiser passes can be
@@ -35,7 +35,7 @@
 #include "version.h"
 
 extern "C" __declspec(dllexport) const char* NAME = MD_PRODUCT;
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS Ray Reconstruction for " MD_GAME " (in development).";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DLSS Ray Reconstruction for " MD_GAME ".";
 
 using namespace reshade::api;
 
@@ -43,6 +43,8 @@ namespace {
 
 constexpr int kCaptureHotkey = VK_F10;
 constexpr int kDumpHotkey = VK_F11;
+// ReShade.ini [MetroExodusRR] Debug=1: compute shader files and the F10/F11 hotkeys (testing).
+bool g_debug = false;
 constexpr int kCaptureFrames = 2;
 
 // ---------------------------------------------------------------- logging
@@ -143,7 +145,7 @@ void OnInitPipeline(device*, pipeline_layout, uint32_t count, const pipeline_sub
         const shader_desc& s = *static_cast<const shader_desc*>(subobjects[i].data);
         if (!s.code || !s.code_size) continue;
         const uint32_t h = Fnv(s.code, s.code_size);
-        if (t == pipeline_subobject_type::compute_shader) SaveComputeShader(h, s.code, s.code_size);
+        if (t == pipeline_subobject_type::compute_shader && g_debug) SaveComputeShader(h, s.code, s.code_size);
         if (t == pipeline_subobject_type::compute_shader) ids.cs = h;
         else if (t == pipeline_subobject_type::vertex_shader) ids.vs = h;
         else ids.ps = h;
@@ -540,10 +542,10 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
-    bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kCaptureHotkey) & 0x8000);
+    bool down = g_debug && pid == GetCurrentProcessId() && (GetAsyncKeyState(kCaptureHotkey) & 0x8000);
     if (down && !g_keyWasDown) StartCapture();
     g_keyWasDown = down;
-    const bool dumpDown = pid == GetCurrentProcessId() && (GetAsyncKeyState(kDumpHotkey) & 0x8000);
+    const bool dumpDown = g_debug && pid == GetCurrentProcessId() && (GetAsyncKeyState(kDumpHotkey) & 0x8000);
     if (dumpDown && !g_dumpKeyWasDown) rt::RequestDump();
     g_dumpKeyWasDown = dumpDown;
 }
@@ -551,14 +553,17 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
 // ---------------------------------------------------------------- overlay
 
 void DrawOverlay(effect_runtime*) {
-    ImGui::TextDisabled(MD_PRODUCT " " MD_VERSION " (probe + experiments; all off = no change to the game)");
-    ImGui::TextUnformatted(ngx::Status().c_str());
+    ImGui::TextDisabled(MD_PRODUCT " " MD_VERSION);
+    rt::DrawSettings();
+    ImGui::Spacing();
+    if (!ImGui::CollapsingHeader("Advanced (testing tools)")) return;
+    ImGui::TextDisabled("%s", ngx::Status().c_str());
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
-    if (ImGui::Button("Capture frame (F10)")) StartCapture();
+    if (ImGui::Button(g_debug ? "Capture frame (F10)" : "Capture frame")) StartCapture();
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
-    rt::DrawOverlay();
+    rt::DrawAdvanced();
 }
 
 }  // namespace
@@ -609,8 +614,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             if (!reshade::register_addon(module)) return FALSE;
             g_loadTick = GetTickCount64();
             OpenLog();
+            reshade::get_config_value(nullptr, MD_PRODUCT, "Debug", g_debug);
+            if (g_debug) Log("Debug=1: compute shader files and F10/F11 hotkeys on");
             ngx::Install();
             rt::Register();
+            rt::LoadSettings();
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
             reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
