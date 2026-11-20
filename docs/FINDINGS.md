@@ -271,6 +271,12 @@ normal *0.5+0.5, a = material id/3 (id 2 = F0 0.05, id 3 = roughness tweak); RT2
 - nvngx_dlssd.dll 310.9.16 copied next to the exe by build.ps1 -Install (from CallistoDLSS 1.0.3).
 - Open risk: the game's NGX is SDK rel_1_6 (old); the driver may refuse RR in that session.
 
+Run 1 (analysis/run9): **RR works in the game's NGX session.** "Ray Reconstruction created:
+2224x1248 -> 3840x2160, quality 1, flags 0xb", evaluated every frame for ~75 s with no failure;
+guides, frame count reset and centre pass all running. One "G-buffer state 0" on the very first
+composite (barrier not seen yet), fine from the next frame. Projection that run: P00 1.1547,
+P11 1.7321 (P00 differs from run2's 0.913: read live every frame, so fine).
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
