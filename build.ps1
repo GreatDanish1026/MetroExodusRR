@@ -28,7 +28,7 @@ $cmd = @(
     "call `"$vcvars`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" " +
-     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\src\ngx.cpp`" user32.lib " +
+     "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\src\ngx.cpp`" `"$root\src\rt.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" user32.lib " +
      "/link /DLL /OUT:`"$addon`" /PDB:`"$obj\MetroExodusRR.pdb`" /DEBUG")
 ) -join " && "
 cmd /c $cmd

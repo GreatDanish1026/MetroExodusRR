@@ -18,6 +18,21 @@ void CaptureNote(uint64_t nativeCommandList, const std::string& line);
 
 uint64_t PresentCount();
 
+// Stable id (FNV hash of the bytecode) of a pipeline's compute shader, 0 if none/unknown.
+uint32_t ComputeShaderId(uint64_t pipelineHandle);
+// Folder of the game exe, with a trailing backslash.
+const std::wstring& ExeDir();
+// The game's D3D12 device (nullptr before it exists).
+reshade::api::device* CurrentDevice();
+
+namespace rt {
+void Register();
+void Unregister();
+void OnDestroyDevice(reshade::api::device* dev);
+void RequestDump();  // F11: binding maps + constant buffers of the known passes
+void DrawOverlay();
+}  // namespace rt
+
 namespace ngx {
 void Install();    // hooks GetProcAddress in MetroExodus.exe's import table
 void Uninstall();  // restores it; the game's NGX pointers fall back to the driver's functions

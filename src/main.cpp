@@ -2,7 +2,8 @@
 // will replace the game's ray-tracing denoisers and DLSS Super Resolution with DLSS Ray
 // Reconstruction.
 //
-// 0.0.1 is a probe and changes nothing in the game:
+// 0.0.2 adds live experiments on the game's ray-tracing denoiser (rt.cpp); with every experiment
+// off it still changes nothing. The probe parts:
 // - ngx.cpp logs every call the game makes to DLSS (NGX) with all of its inputs.
 // - Every compute shader the game creates is saved once to MetroExodusRR-shaders\csXXXXXXXX.dxil
 //   (same id as in the capture) with its debug name in the log, so the denoiser passes can be
@@ -41,6 +42,7 @@ using namespace reshade::api;
 namespace {
 
 constexpr int kCaptureHotkey = VK_F10;
+constexpr int kDumpHotkey = VK_F11;
 constexpr int kCaptureFrames = 2;
 
 // ---------------------------------------------------------------- logging
@@ -504,6 +506,7 @@ void OnInitDevice(device* dev) {
 }
 
 void OnDestroyDevice(device* dev) {
+    rt::OnDestroyDevice(dev);
     if (g_device == dev) g_device = nullptr;
 }
 
@@ -515,7 +518,7 @@ void OnInitSwapchain(swapchain* sc, bool resize) {
         static_cast<uint32_t>(dev->get_api()), sc->get_hwnd());
 }
 
-bool g_keyWasDown = false;
+bool g_keyWasDown = false, g_dumpKeyWasDown = false;
 
 void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t, const rect*) {
     const uint64_t n = ++g_presents;
@@ -540,18 +543,22 @@ void OnPresent(command_queue*, swapchain* sc, const rect*, const rect*, uint32_t
     bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(kCaptureHotkey) & 0x8000);
     if (down && !g_keyWasDown) StartCapture();
     g_keyWasDown = down;
+    const bool dumpDown = pid == GetCurrentProcessId() && (GetAsyncKeyState(kDumpHotkey) & 0x8000);
+    if (dumpDown && !g_dumpKeyWasDown) rt::RequestDump();
+    g_dumpKeyWasDown = dumpDown;
 }
 
 // ---------------------------------------------------------------- overlay
 
 void DrawOverlay(effect_runtime*) {
-    ImGui::TextDisabled(MD_PRODUCT " " MD_VERSION " (probe: changes nothing in the game)");
+    ImGui::TextDisabled(MD_PRODUCT " " MD_VERSION " (probe + experiments; all off = no change to the game)");
     ImGui::TextUnformatted(ngx::Status().c_str());
     ImGui::BeginDisabled(g_capture.load() != Capture::Idle);
     if (ImGui::Button("Capture frame (F10)")) StartCapture();
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::TextDisabled("%s", g_capture.load() == Capture::Recording ? "recording..." : g_status.c_str());
+    rt::DrawOverlay();
 }
 
 }  // namespace
@@ -590,6 +597,12 @@ void CaptureNote(uint64_t nativeCommandList, const std::string& line) {
 
 uint64_t PresentCount() { return g_presents.load(); }
 
+uint32_t ComputeShaderId(uint64_t pipelineHandle) { return Pipe(pipeline{pipelineHandle}).cs; }
+
+const std::wstring& ExeDir() { return g_exeDir; }
+
+device* CurrentDevice() { return g_device.load(); }
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
@@ -597,6 +610,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             g_loadTick = GetTickCount64();
             OpenLog();
             ngx::Install();
+            rt::Register();
             reshade::register_event<reshade::addon_event::init_device>(&OnInitDevice);
             reshade::register_event<reshade::addon_event::destroy_device>(&OnDestroyDevice);
             reshade::register_event<reshade::addon_event::init_swapchain>(&OnInitSwapchain);
@@ -623,6 +637,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             break;
         case DLL_PROCESS_DETACH:
             ngx::Uninstall();
+            rt::Unregister();
             reshade::unregister_addon(module);
             {
                 std::lock_guard<std::mutex> lock(g_logMutex);
