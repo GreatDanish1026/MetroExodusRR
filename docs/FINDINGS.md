@@ -138,6 +138,25 @@ gi-gapfix, and replace gi-spatial-blur by a copy of mip 0 of A/B. The composite 
 RGB of every rgba16f/rgba32f/r11g11b10f texture of the viewer's pass, logged) to check whether
 1-sample GI keeps the game's brightness.
 
+### 0.0.3 measurements (analysis/run3, rt-composite textures read at present, dark scene)
+
+| texture | denoiser on | denoiser OFF |
+|---|---|---|
+| u0 lit colour (DLSS input) lum | 0.0119 (max 0.90) | 0.0069 (max 0.54), **-42 %** |
+| t9 GI A lum | 0.0003 | 0.0000 (max 0.21: sparse spikes) |
+| t10 GI B (b channel) | 0.0827 | 0.0018 |
+| t5 reflections lum | 0.0002 | 0.0000 |
+
+Cause, from cs66e47af2's end: the chains are stored **without** a per-pixel factor
+f = saturate(B.z * 12) * 0.9 + 0.1 (the temporal pass divides history by f, the blur multiplies
+its weighted average by f again). Output A = f * avg(A); output B = (f * B.x', f * B.y', B.z,
+count/15) where B.x'/B.y' have their low 4 bits forced to 7 (they carry packed count bits) and
+count = low 4 bits of B.y. A plain copy of mip 0 skips the f multiply (f >= 0.1, so up to 10x too
+dark) and keeps the packed bits: that is the darkening, not lost energy.
+
+Fix: replace the blur with a centre-only shader of our own that does exactly that output step
+(0.0.4), then measure again.
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
