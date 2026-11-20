@@ -84,6 +84,21 @@ Hard part: the GI hit shading lives inside the temporal pass, so "denoiser off" 
 that pass but with history weight 0 (constants in its root CBV, or a patched shader) and skipping
 the spatial passes 2-4.
 
+Correction after reading the shaders more closely: cs1fce2042 has **no history input**; it only
+shades the GI hits (8-sample loop, result x pi, hit distance in alpha), so #97eff is the raw,
+noisy per-pixel GI radiance. The temporal accumulation is csb83925ed (7 inputs, writes mips 0-2
+of the two rgba16f chains), and cs66e47af2 is an 8-tap bilateral blur over the two chains.
+
+## 0.0.2 (experiments, all off by default)
+
+rt.cpp follows each command list's compute state and resolves the known passes' t#/u# textures
+through ReShade's descriptor_tracking (binding map logged once per pass, again on F11). F11 also
+writes each pass's root CBV to `MetroExodusRR-cb-<pass>-p<param>.bin`. Overlay: clear GI history
+(temporal inputs that the final blur wrote last frame), replace the final blur by a copy of t3/t4
+(optionally swapped), skip the temporal/mips/gapfix/blur passes, and a texture viewer for any
+bound texture of a known pass (copied on the present queue, state from the last observed
+barrier; per-mip barriers aren't distinguished, so mip-chain states are a guess).
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
