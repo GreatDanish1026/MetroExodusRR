@@ -186,6 +186,21 @@ pass trusts a black history and the GI fades towards 0.
 temporal pass): weight 1 = current frame only, depth test intact. "GI denoiser OFF" = reset count
 + skip mips/gapfix + centre-only output. The sweep's 4th row is now "reset frame count only".
 
+### 0.0.6 sweep (analysis/run6)
+
+| combination | lit u0 lum |
+|---|---|
+| game | 0.0361 |
+| centre-only blur | 0.0361 |
+| centre-only + skip mips/gapfix | 0.0359 |
+| reset frame count only | 0.0356 (-1 %) |
+| all (denoiser OFF) | 0.0303 (**-16 %**) |
+
+Both passes run (log). Each change alone is within 1 %; only the full combination loses 16 %:
+f = saturate(B.z * 12) * 0.9 + 0.1 of a single noisy B.z sample is biased low (clipping; the
+game's blur computes f from blurred B.z). 0.0.7: the centre pass takes B.z (and f) from a 5x5
+stride-2 average of B.z; A, B.x, B.y stay the centre pixel (noisy GI colour for RR).
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
