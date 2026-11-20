@@ -27,6 +27,7 @@ $addon = "$root\bin\MetroExodusRR.addon64"
 $cmd = @(
     "call `"$vcvars`" >nul",
     "fxc /nologo /T cs_5_1 /E main /O3 /Vn kGiCenterCs /Fh `"$obj\gi_center_cs.h`" `"$root\src\gi_center.hlsl`" >nul",
+    "fxc /nologo /T cs_5_1 /E main /O3 /Vn kCountResetCs /Fh `"$obj\count_reset_cs.h`" `"$root\src\count_reset.hlsl`" >nul",
     ("cl /nologo /std:c++17 /O2 /EHsc /MT /W3 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX " +
      "/I `"$root\third_party\imgui`" /I `"$root\third_party\reshade\include`" /I `"$root\third_party\dlss\include`" /I `"$obj`" " +
      "/Fo`"$obj\\`" `"$root\src\main.cpp`" `"$root\src\ngx.cpp`" `"$root\src\rt.cpp`" `"$root\third_party\reshade\utils\descriptor_tracking.cpp`" user32.lib " +

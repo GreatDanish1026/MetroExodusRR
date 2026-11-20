@@ -31,7 +31,8 @@
 #include <vector>
 
 #include "../third_party/reshade/utils/descriptor_tracking.hpp"
-#include "gi_center_cs.h"  // kGiCenterCs, built from gi_center.hlsl
+#include "gi_center_cs.h"    // kGiCenterCs, built from gi_center.hlsl
+#include "count_reset_cs.h"  // kCountResetCs, built from count_reset.hlsl
 #include "common.hpp"
 #include "version.h"
 
@@ -99,13 +100,15 @@ std::unordered_map<uint64_t, resource_view> g_srvs;    // our SRVs (centre pass)
 // Experiments (overlay, live)
 std::atomic<bool> g_skip[kPassCount] = {};
 std::atomic<bool> g_blurCopy{false};
-std::atomic<bool> g_clearHistory{false};
+std::atomic<bool> g_clearHistory{false};  // breaks the GI (count kept, history black): kept for reference
+std::atomic<bool> g_resetCount{false};    // frame count bits of the temporal pass's t3 zeroed
 // All of the GI denoiser off at once: history cleared, mips + gap fix skipped, blur -> copy.
 std::atomic<bool> g_denoiserOff{false};
 std::atomic<bool> g_measureRequested{false};
 std::atomic<bool> g_dumpRequested{false};
 
-bool ClearHistoryOn() { return g_clearHistory.load() || g_denoiserOff.load(); }
+bool ClearHistoryOn() { return g_clearHistory.load(); }
+bool ResetCountOn() { return g_resetCount.load() || g_denoiserOff.load(); }
 bool BlurCopyOn() { return g_blurCopy.load() || g_denoiserOff.load(); }
 bool SkipOn(int pass) { return g_skip[pass].load() || (g_denoiserOff.load() && (pass == kGiMips || pass == kGiGapFix)); }
 std::atomic<bool> g_dumpPending[kPassCount] = {};
@@ -319,6 +322,66 @@ bool RunCentre(command_list* cl, const ListState& st, const BindingMap& m) {
     return true;
 }
 
+// ---------------------------------------------------------------- frame count reset pass
+
+pipeline_layout g_resetLayout = {0};
+pipeline g_resetPipe = {0};
+bool g_resetFailed = false;
+std::atomic<uint64_t> g_resetRuns{0};
+std::string g_resetError;
+
+void ResetFail(const std::string& why) {
+    if (g_resetError != why) Log("frame count reset not run: %s", why.c_str());
+    g_resetError = why;
+}
+
+bool RunCountReset(command_list* cl, const ListState& st, const BindingMap& m) {
+    device* dev = cl->get_device();
+    if (!g_resetPipe.handle && !g_resetFailed) {
+        descriptor_range uav = {};
+        uav.count = 1;
+        uav.visibility = shader_stage::all_compute;
+        uav.type = descriptor_type::unordered_access_view;
+        const pipeline_layout_param param(uav);
+        shader_desc cs = {};
+        cs.code = kCountResetCs;
+        cs.code_size = sizeof(kCountResetCs);
+        pipeline_subobject sub = {pipeline_subobject_type::compute_shader, 1, &cs};
+        if (!dev->create_pipeline_layout(1, &param, &g_resetLayout) || !dev->create_pipeline(g_resetLayout, 1, &sub, &g_resetPipe)) {
+            g_resetFailed = true;
+            ResetFail("couldn't create the shader");
+        } else {
+            Log("frame count reset shader created");
+        }
+    }
+    if (!g_resetPipe.handle) return false;
+    const resource r = Find(m, "t3");
+    if (!r.handle) return ResetFail("temporal t3 missing"), false;
+    const resource_desc d = dev->get_resource_desc(r);
+    if (d.texture.format != format::r32_float) return ResetFail("temporal t3 isn't r32f"), false;
+    resource_usage state;
+    {
+        std::lock_guard<std::mutex> lock(g_mapMutex);
+        state = StateOf(r);
+    }
+    if (state != resource_usage::shader_resource_non_pixel) return ResetFail(Format("t3 state %x", (unsigned)state)), false;
+    const resource_view uav = CachedView(dev, r, true);
+    if (!uav.handle) return ResetFail("no UAV for t3"), false;
+    cl->barrier(r, state, resource_usage::unordered_access);
+    cl->bind_pipeline(pipeline_stage::all_compute, g_resetPipe);
+    descriptor_table_update u = {};
+    u.count = 1;
+    u.type = descriptor_type::unordered_access_view;
+    u.descriptors = &uav;
+    cl->push_descriptors(shader_stage::all_compute, g_resetLayout, 0, u);
+    cl->dispatch((d.texture.width + 7) / 8, (d.texture.height + 7) / 8, 1);
+    cl->barrier(r, resource_usage::unordered_access, state);
+    RestoreCompute(cl, st);
+    if (g_resetRuns++ == 0) Log("frame count reset ran (first time)");
+    g_resetError.clear();
+    return true;
+}
+
 bool ClearTex(command_list* cl, resource r, resource_usage state) {
     if (state == resource_usage::undefined) return false;
     device* dev = cl->get_device();
@@ -434,6 +497,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     if (first || dump) LogMap(pass, m);
     if (dump) DumpConstants(dev, pass, st);
 
+    if (pass == kGiTemporal && ResetCountOn() && RunCountReset(cl, st, m)) ++g_actions;
     if (pass == kGiTemporal && ClearHistoryOn()) {
         // History = inputs of the temporal pass that the final blur wrote last frame.
         BindingMap blur;
@@ -603,13 +667,13 @@ std::string MeasurePass(command_queue* q, int mp, const char* label) {
 // gi-temporal are measured. The user's own switches are put back afterwards.
 struct SweepConfig {
     const char* name;
-    bool clearHistory, centre, skipMipsGap;
+    bool resetCount, centre, skipMipsGap;
 };
 const SweepConfig kSweep[] = {
     {"all off (game)", false, false, false},
     {"centre-only blur", false, true, false},
     {"centre-only + skip mips/gapfix", false, true, true},
-    {"clear history only", true, false, false},
+    {"reset frame count only", true, false, false},
     {"all (denoiser OFF)", true, true, true},
 };
 constexpr int kSweepCount = sizeof(kSweep) / sizeof(kSweep[0]);
@@ -621,7 +685,8 @@ std::string g_sweepResult;  // g_viewMutex
 
 void ApplySweep(const SweepConfig& c) {
     g_denoiserOff = false;
-    g_clearHistory = c.clearHistory;
+    g_clearHistory = false;
+    g_resetCount = c.resetCount;
     g_blurCopy = c.centre;
     g_skip[kGiMips] = c.skipMipsGap;
     g_skip[kGiGapFix] = c.skipMipsGap;
@@ -629,7 +694,7 @@ void ApplySweep(const SweepConfig& c) {
 
 void SweepStep(command_queue* q) {
     if (g_sweepRequested.exchange(false) && g_sweepIndex < 0) {
-        g_savedFlags[0] = g_denoiserOff, g_savedFlags[1] = g_clearHistory, g_savedFlags[2] = g_blurCopy;
+        g_savedFlags[0] = g_denoiserOff, g_savedFlags[1] = g_resetCount, g_savedFlags[2] = g_blurCopy;
         g_savedFlags[3] = g_skip[kGiMips], g_savedFlags[4] = g_skip[kGiGapFix];
         g_sweepIndex = 0;
         g_sweepWait = kSweepSettle;
@@ -661,7 +726,7 @@ void SweepStep(command_queue* q) {
         return;
     }
     g_sweepIndex = -1;
-    g_denoiserOff = g_savedFlags[0], g_clearHistory = g_savedFlags[1], g_blurCopy = g_savedFlags[2];
+    g_denoiserOff = g_savedFlags[0], g_resetCount = g_savedFlags[1], g_blurCopy = g_savedFlags[2];
     g_skip[kGiMips] = g_savedFlags[3], g_skip[kGiGapFix] = g_savedFlags[4];
     Log("sweep done");
 }
@@ -753,6 +818,11 @@ void OnDestroyDevice(device* dev) {
     for (auto& kv : g_srvs) dev->destroy_resource_view(kv.second);
     g_uavs.clear();
     g_srvs.clear();
+    if (g_resetPipe.handle) dev->destroy_pipeline(g_resetPipe);
+    if (g_resetLayout.handle) dev->destroy_pipeline_layout(g_resetLayout);
+    g_resetPipe = {0};
+    g_resetLayout = {0};
+    g_resetFailed = false;
     if (g_centrePipe.handle) dev->destroy_pipeline(g_centrePipe);
     if (g_centreLayout.handle) dev->destroy_pipeline_layout(g_centreLayout);
     g_centrePipe = {0};
@@ -781,8 +851,12 @@ void DrawOverlay() {
     bool v = g_denoiserOff.load();
     if (ImGui::Checkbox("GI denoiser OFF (all of the below at once)", &v)) g_denoiserOff = v;
     ImGui::TextDisabled("Individual experiments:");
+    v = g_resetCount.load();
+    if (ImGui::Checkbox("GI: reset the frame count (no temporal accumulation)", &v)) g_resetCount = v;
+    if (!g_resetError.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%s", g_resetError.c_str());
+    ImGui::TextDisabled("frame count resets run: %llu", g_resetRuns.load());
     v = g_clearHistory.load();
-    if (ImGui::Checkbox("GI: clear history before the temporal pass", &v)) g_clearHistory = v;
+    if (ImGui::Checkbox("GI: clear history (darkens: reference only)", &v)) g_clearHistory = v;
     v = g_blurCopy.load();
     if (ImGui::Checkbox("GI: replace the final spatial blur with the centre sample only", &v)) g_blurCopy = v;
     if (!g_centreError.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%s", g_centreError.c_str());

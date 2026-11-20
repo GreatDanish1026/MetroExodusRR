@@ -166,6 +166,26 @@ most likely the temporal pass with cleared history (B.z = lerp(history B.z, raw 
 output step. 0.0.5 adds a sweep that measures each combination (game, centre only, centre +
 skips, clear history only, all) after 90 frames each, to pin it down.
 
+### 0.0.5 sweep (analysis/run5): the culprit is clearing the history
+
+| combination | lit u0 lum | GI B (t10) b |
+|---|---|---|
+| game | 0.0360 | 0.0830 |
+| centre-only blur | 0.0364 | 0.0795 |
+| centre-only + skip mips/gapfix | 0.0361 | 0.0805 |
+| clear history only | **0.0249** | 0.0004 |
+| all | **0.0250** | 0.0011 |
+
+The centre-only pass and the skips keep the brightness; clearing the history kills the GI.
+Reason (csb83925ed start): the frame count is **not** in the colour history. The pass gathers its
+t3 = last frame's r32f (depth with the count in the low 5 mantissa bits), checks depth for
+disocclusion (|d - d0| / d < 0.04) and interpolates the counts. Cleared colour + kept count = the
+pass trusts a black history and the GI fades towards 0.
+
+0.0.6: "reset frame count" zeroes the low 5 bits of t3 (count_reset.hlsl, in place, before the
+temporal pass): weight 1 = current frame only, depth test intact. "GI denoiser OFF" = reset count
++ skip mips/gapfix + centre-only output. The sweep's 4th row is now "reset frame count only".
+
 Next (0.0.2): live experiments in the overlay — skip passes 2-4, dump/patch cs1fce2042's
 constants to find the history weight — and decode the G-buffer channels (albedo, roughness,
 metalness) for RR's guides. Then 0.1.0: create the RR feature (dlssd) on the game's NGX and
