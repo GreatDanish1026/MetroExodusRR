@@ -4,4 +4,4 @@
 #define MD_PRODUCT "MetroExodusRR"  // add-on name, log file name, ReShade.ini section
 #define MD_PRODUCT_W L"MetroExodusRR"
 #define MD_GAME "Metro Exodus Enhanced Edition"
-#define MD_VERSION "0.0.2"
+#define MD_VERSION "0.0.3"

@@ -20,6 +20,7 @@
 #include <reshade.hpp>
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -97,7 +98,14 @@ std::atomic<bool> g_skip[kPassCount] = {};
 std::atomic<bool> g_blurCopy{false};
 std::atomic<bool> g_blurCopySwap{false};
 std::atomic<bool> g_clearHistory{false};
+// All of the GI denoiser off at once: history cleared, mips + gap fix skipped, blur -> copy.
+std::atomic<bool> g_denoiserOff{false};
+std::atomic<bool> g_measureRequested{false};
 std::atomic<bool> g_dumpRequested{false};
+
+bool ClearHistoryOn() { return g_clearHistory.load() || g_denoiserOff.load(); }
+bool BlurCopyOn() { return g_blurCopy.load() || g_denoiserOff.load(); }
+bool SkipOn(int pass) { return g_skip[pass].load() || (g_denoiserOff.load() && (pass == kGiMips || pass == kGiGapFix)); }
 std::atomic<bool> g_dumpPending[kPassCount] = {};
 std::atomic<uint64_t> g_actions{0};  // experiment actions done (for the overlay)
 
@@ -310,7 +318,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
     if (first || dump) LogMap(pass, m);
     if (dump) DumpConstants(dev, pass, st);
 
-    if (pass == kGiTemporal && g_clearHistory.load()) {
+    if (pass == kGiTemporal && ClearHistoryOn()) {
         // History = inputs of the temporal pass that the final blur wrote last frame.
         BindingMap blur;
         {
@@ -331,7 +339,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
             if (ClearTex(cl, s.res, state)) ++g_actions;
         }
     }
-    if (pass == kGiBlur && g_blurCopy.load()) {
+    if (pass == kGiBlur && BlurCopyOn()) {
         const bool swap = g_blurCopySwap.load();
         const resource in0 = Find(m, swap ? "t4" : "t3"), in1 = Find(m, swap ? "t3" : "t4");
         const resource out0 = Find(m, "u0"), out1 = Find(m, "u1");
@@ -348,7 +356,7 @@ bool OnDispatch(command_list* cl, uint32_t x, uint32_t y, uint32_t z) {
             }
         }
     }
-    if (kPasses[pass].skippable && g_skip[pass].load()) {
+    if (kPasses[pass].skippable && SkipOn(pass)) {
         ++g_actions;
         return true;
     }
@@ -384,9 +392,112 @@ bool Viewable(format f) {
     }
 }
 
+// ---------------------------------------------------------------- brightness measurement
+//
+// One click: every colour texture bound to the viewer's pass is copied to a readback buffer, the
+// queue is waited on (a one-off hitch), and the average R, G, B is computed on the CPU. Lets the
+// "denoiser off" result be compared with the game's own for a brightness shift.
+
+std::string g_measure;  // g_viewMutex
+
+float HalfToFloat(uint16_t h) {
+    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    float v;
+    if (e == 0) v = m / 1024.0f / 16384.0f;
+    else if (e == 31) v = 0;  // inf/nan: ignore
+    else v = (1.0f + m / 1024.0f) * ldexpf(1.0f, static_cast<int>(e) - 15);
+    return s ? -v : v;
+}
+
+float SmallFloat(uint32_t bits, int mantBits) {  // unsigned 5-bit-exponent floats of r11g11b10
+    const uint32_t e = bits >> mantBits, m = bits & ((1u << mantBits) - 1);
+    if (e == 31) return 0;
+    if (e == 0) return m / static_cast<float>(1u << mantBits) / 16384.0f;
+    return (1.0f + m / static_cast<float>(1u << mantBits)) * ldexpf(1.0f, static_cast<int>(e) - 15);
+}
+
+bool Measurable(format f, uint32_t* bpp) {
+    switch (f) {
+        case format::r16g16b16a16_float: *bpp = 8; return true;
+        case format::r32g32b32a32_float: *bpp = 16; return true;
+        case format::r11g11b10_float: *bpp = 4; return true;
+        default: return false;
+    }
+}
+
+std::string MeasureOne(command_queue* q, resource src, resource_usage state) {
+    device* dev = q->get_device();
+    const resource_desc d = dev->get_resource_desc(src);
+    uint32_t bpp = 0;
+    if (d.type != resource_type::texture_2d || !Measurable(d.texture.format, &bpp)) return "";
+    if (state == resource_usage::undefined) return "state unknown";
+    const uint32_t w = d.texture.width, h = d.texture.height;
+    const uint32_t pitch = (w * bpp + 255) & ~255u;
+    resource buf = {0};
+    if (!dev->create_resource(resource_desc(static_cast<uint64_t>(pitch) * h, memory_heap::readback, resource_usage::copy_dest), nullptr,
+                              resource_usage::copy_dest, &buf))
+        return "readback buffer failed";
+    command_list* cl = q->get_immediate_command_list();
+    cl->barrier(src, state, resource_usage::copy_source);
+    cl->copy_texture_to_buffer(src, 0, nullptr, buf, 0, pitch / bpp, h);
+    cl->barrier(src, resource_usage::copy_source, state);
+    q->flush_immediate_command_list();
+    q->wait_idle();
+    std::string out = "map failed";
+    void* data = nullptr;
+    if (dev->map_buffer_region(buf, 0, static_cast<uint64_t>(pitch) * h, map_access::read_only, &data) && data) {
+        double sum[3] = {}, mx = 0;
+        uint64_t n = 0;
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* row = static_cast<const uint8_t*>(data) + static_cast<size_t>(y) * pitch;
+            for (uint32_t x = 0; x < w; ++x) {
+                float c[3];
+                if (bpp == 8) {
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(row) + x * 4;
+                    for (int i = 0; i < 3; ++i) c[i] = HalfToFloat(p[i]);
+                } else if (bpp == 16) {
+                    const float* p = reinterpret_cast<const float*>(row) + x * 4;
+                    for (int i = 0; i < 3; ++i) c[i] = std::isfinite(p[i]) ? p[i] : 0;
+                } else {
+                    const uint32_t v = reinterpret_cast<const uint32_t*>(row)[x];
+                    c[0] = SmallFloat(v & 0x7ff, 6), c[1] = SmallFloat((v >> 11) & 0x7ff, 6), c[2] = SmallFloat(v >> 22, 5);
+                }
+                for (int i = 0; i < 3; ++i) sum[i] += c[i];
+                const double l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                if (l > mx) mx = l;
+                ++n;
+            }
+        }
+        dev->unmap_buffer_region(buf);
+        out = Format("avg %.4f %.4f %.4f  lum %.4f  max lum %.2f", sum[0] / n, sum[1] / n, sum[2] / n,
+                     (0.2126 * sum[0] + 0.7152 * sum[1] + 0.0722 * sum[2]) / n, mx);
+    }
+    dev->destroy_resource(buf);
+    return out;
+}
+
 void OnPresent(command_queue* q, swapchain*, const rect*, const rect*, uint32_t, const rect*) {
     if (g_dumpRequested.exchange(false))
         for (int i = 0; i < kPassCount; ++i) g_dumpPending[i] = true;
+
+    if (g_measureRequested.exchange(false) && g_viewPass.load() >= 0) {
+        const int mp = g_viewPass.load();
+        BindingMap m;
+        std::vector<resource_usage> states;
+        {
+            std::lock_guard<std::mutex> lock(g_mapMutex);
+            m = g_maps[mp];
+            for (const Slot& s : m.slots) states.push_back(StateOf(s.res));
+        }
+        std::string all = Format("%s, denoiser %s:", kPasses[mp].name, g_denoiserOff.load() ? "OFF" : "on");
+        for (size_t i = 0; i < m.slots.size(); ++i) {
+            const std::string r = MeasureOne(q, m.slots[i].res, states[i]);
+            if (!r.empty()) all += Format("\n  %s %s", m.slots[i].reg, r.c_str());
+        }
+        Log("measure %s", all.c_str());
+        std::lock_guard<std::mutex> vlock(g_viewMutex);
+        g_measure = all;
+    }
 
     const int pass = g_viewPass.load();
     device* dev = q->get_device();
@@ -482,7 +593,10 @@ void DrawOverlay() {
                           !seen ? "never" : age <= 2 ? Format("active, %u dispatch(es)", m.dispatches).c_str() : "not this frame");
     }
     ImGui::Separator();
-    bool v = g_clearHistory.load();
+    bool v = g_denoiserOff.load();
+    if (ImGui::Checkbox("GI denoiser OFF (all of the below at once)", &v)) g_denoiserOff = v;
+    ImGui::TextDisabled("Individual experiments:");
+    v = g_clearHistory.load();
     if (ImGui::Checkbox("GI: clear history before the temporal pass", &v)) g_clearHistory = v;
     v = g_blurCopy.load();
     if (ImGui::Checkbox("GI: replace the final spatial blur with a copy", &v)) g_blurCopy = v;
@@ -520,6 +634,8 @@ void DrawOverlay() {
         ImGui::TextUnformatted(Desc(s.res).c_str());
     }
     ImGui::TextUnformatted(g_viewInfo.c_str());
+    if (ImGui::Button("Measure brightness of this pass's textures")) g_measureRequested = true;
+    if (!g_measure.empty()) ImGui::TextUnformatted(g_measure.c_str());
     if (g_viewSrv.handle && g_viewDesc.texture.width) {
         const float w = ImGui::GetContentRegionAvail().x;
         const float h = w * g_viewDesc.texture.height / static_cast<float>(g_viewDesc.texture.width);
